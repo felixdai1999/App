@@ -5,7 +5,7 @@ import Combine
 #if os(iOS) || os(visionOS)
 struct WebView: UIViewRepresentable {
     let tab: BrowserTab
-    let topBarHeight: CGFloat
+    let bottomBarHeight: CGFloat
 
     func makeCoordinator() -> Coordinator {
         Coordinator(tab: tab)
@@ -26,8 +26,8 @@ struct WebView: UIViewRepresentable {
         let window = UIApplication.shared.connectedScenes
             .compactMap { $0 as? UIWindowScene }
             .first?.windows.first
-        let bottomInset = window?.safeAreaInsets.bottom ?? 0
-        let topInset = (window?.safeAreaInsets.top ?? 0) + topBarHeight
+        let bottomInset = (window?.safeAreaInsets.bottom ?? 0) + bottomBarHeight
+        let topInset = window?.safeAreaInsets.top ?? 0
         
         tab.webView.scrollView.contentInset.bottom = bottomInset
         tab.webView.scrollView.verticalScrollIndicatorInsets.bottom = bottomInset
@@ -41,9 +41,9 @@ struct WebView: UIViewRepresentable {
         let window = UIApplication.shared.connectedScenes
             .compactMap { $0 as? UIWindowScene }
             .first?.windows.first
-        let topInset = (window?.safeAreaInsets.top ?? 0) + topBarHeight
-        webView.scrollView.contentInset.top = topInset
-        webView.scrollView.verticalScrollIndicatorInsets.top = topInset
+        let bottomInset = (window?.safeAreaInsets.bottom ?? 0) + bottomBarHeight
+        webView.scrollView.contentInset.bottom = bottomInset
+        webView.scrollView.verticalScrollIndicatorInsets.bottom = bottomInset
     }
 
     class Coordinator: NSObject, UIScrollViewDelegate {

@@ -22,7 +22,7 @@ enum TabGroup: String, CaseIterable {
 @Observable
 class BrowserViewModel {
     var activeGroup: TabGroup = .normal
-    var topBarHeight: CGFloat = 60
+    var bottomBarHeight: CGFloat = 60
     var normalTabs: [BrowserTab] = []
     var privateTabs: [BrowserTab] = []
     var normalSelectedID: UUID?

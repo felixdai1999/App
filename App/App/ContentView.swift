@@ -31,12 +31,14 @@ struct ContentView: View {
     @State private var showHistory = false
     @State private var showBookmarks = false
     @State private var showSettings = false
+    @State private var bottomContainerWidth: CGFloat = 300
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @Environment(\.verticalSizeClass) private var verticalSizeClass
 
     private var shouldShowTabStrip: Bool {
         #if os(iOS)
-        return horizontalSizeClass == .regular || verticalSizeClass == .compact
+        let isEligibleClass = horizontalSizeClass == .regular || verticalSizeClass == .compact
+        return isEligibleClass && isToolbarExpanded
         #else
         return true
         #endif
@@ -203,55 +205,49 @@ struct ContentView: View {
     // MARK: - Browser View
 
     private var browserView: some View {
-        ZStack(alignment: .top) {
+        ZStack(alignment: .bottom) {
             contentArea
                 #if os(iOS)
                 .ignoresSafeArea(edges: .bottom)
                 .ignoresSafeArea(edges: .top)
-                .overlay(alignment: .bottom) {
-                    bottomToolbar
-                }
                 #endif
 
             let expanded = isToolbarExpanded || isAddressBarFocused
             let backStyle = AnyShapeStyle(.clear)
 
             VStack(spacing: 0) {
-                if viewModel.isPrivate {
-                    privateIndicator
+                if showFindBar {
+                    findBar
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
                 }
 
                 if shouldShowTabStrip {
                     tabStrip
-                        .transition(.move(edge: .top).combined(with: .opacity))
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
                 }
 
                 addressBar
-
-                if showFindBar {
-                    findBar
-                        .transition(.move(edge: .top).combined(with: .opacity))
-                }
             }
-            .background(backStyle, ignoresSafeAreaEdges: .top)
+            .background(backStyle, ignoresSafeAreaEdges: .bottom)
             .background(
                 GeometryReader { proxy in
                     Color.clear.onChange(of: proxy.size.height) { _, newHeight in
                         if expanded {
-                            viewModel.topBarHeight = newHeight
+                            viewModel.bottomBarHeight = newHeight
                         }
                     }
+                    .onChange(of: proxy.size.width) { _, newWidth in
+                        bottomContainerWidth = newWidth
+                    }
                     .onAppear {
+                        bottomContainerWidth = proxy.size.width
                         if expanded {
-                            viewModel.topBarHeight = proxy.size.height
+                            viewModel.bottomBarHeight = proxy.size.height
                         }
                     }
                 }
             )
         }
-        #if os(iOS)
-        .ignoresSafeArea(.keyboard)
-        #endif
         .animation(.snappy(duration: 0.25), value: showFindBar)
         .animation(.spring(duration: 0.35, bounce: 0.15), value: shouldShowTabStrip)
         .animation(.spring(duration: 0.35, bounce: 0.15), value: isToolbarExpanded)
@@ -260,11 +256,17 @@ struct ContentView: View {
     // MARK: - Tab Strip
 
     private var tabStrip: some View {
-        ScrollViewReader { proxy in
+        let tabCount = max(1, viewModel.tabs.count)
+        let staticSpace: CGFloat = 72.0
+        let availableTabSpace = max(0, bottomContainerWidth - staticSpace)
+        let totalSpacing = CGFloat(max(0, tabCount - 1)) * 2.0
+        let calculatedWidth = max(110, (availableTabSpace - totalSpacing) / CGFloat(tabCount))
+        
+        return ScrollViewReader { proxy in
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 2) {
                     ForEach(viewModel.tabs) { tab in
-                        tabChip(for: tab)
+                        tabChip(for: tab, tabWidth: calculatedWidth)
                     }
 
                     Button {
@@ -273,17 +275,19 @@ struct ContentView: View {
                         }
                     } label: {
                         Image(systemName: "plus")
-                            .font(.system(size: 11, weight: .semibold))
+                            .font(.system(size: 12, weight: .semibold))
                             .foregroundStyle(.secondary)
-                            .frame(width: 28, height: 28)
-                            .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 7))
+                            .frame(width: 36, height: 36)
+                            .background(Color.primary.opacity(0.05), in: .circle)
                     }
                     .buttonStyle(.plain)
-                    .padding(.leading, 4)
+                    .padding(.leading, 2)
                 }
-                .padding(.horizontal, 8)
+                .padding(.horizontal, 6)
                 .padding(.vertical, 6)
             }
+            .glassEffect(.regular, in: .capsule)
+            .padding(.horizontal, 10)
             .onChange(of: viewModel.selectedTabID) { _, newID in
                 if let id = newID {
                     withAnimation(.easeInOut(duration: 0.2)) {
@@ -294,7 +298,7 @@ struct ContentView: View {
         }
     }
 
-    private func tabChip(for tab: BrowserTab) -> some View {
+    private func tabChip(for tab: BrowserTab, tabWidth: CGFloat) -> some View {
         let isSelected = tab.id == viewModel.selectedTabID
 
         return Button {
@@ -320,36 +324,35 @@ struct ContentView: View {
                     .font(.system(size: 11, weight: isSelected ? .semibold : .regular))
                     .foregroundStyle(isSelected ? .primary : .secondary)
                     .lineLimit(1)
-                    .frame(maxWidth: 100, alignment: .leading)
+                    .frame(maxWidth: .infinity, alignment: .leading)
 
-                Button {
-                    withAnimation(.snappy(duration: 0.25)) {
-                        viewModel.closeTab(tab.id)
-                    }
-                } label: {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 6, weight: .black))
-                        .foregroundStyle(isSelected ? .secondary : .quaternary)
-                        .frame(width: 14, height: 14)
-                        .background(
-                            Circle().fill(Color.primary.opacity(isSelected ? 0.08 : 0.04))
-                        )
-                }
-                .buttonStyle(.plain)
-            }
-            .padding(.leading, 8)
-            .padding(.trailing, 5)
-            .padding(.vertical, 6)
-            .glassEffect(isSelected ? .regular : .identity, in: RoundedRectangle(cornerRadius: 8))
-            .overlay(alignment: .bottom) {
                 if isSelected {
-                    Capsule()
-                        .fill(tab.currentURL != nil ? faviconColor(for: tab) : Color.accentColor)
-                        .frame(height: 2)
-                        .padding(.horizontal, 10)
-                        .offset(y: 1)
+                    Button {
+                        withAnimation(.snappy(duration: 0.25)) {
+                            viewModel.closeTab(tab.id)
+                        }
+                    } label: {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 8, weight: .black))
+                            .foregroundStyle(isSelected ? .primary : .secondary)
+                            .frame(width: 16, height: 16)
+                            .background(
+                                Circle().fill(Color.primary.opacity(isSelected ? 0.08 : 0.04))
+                            )
+                    }
+                    .buttonStyle(.plain)
                 }
             }
+            .padding(.leading, 10)
+            .padding(.trailing, isSelected ? 6 : 10)
+            .padding(.vertical, 10)
+            .frame(width: tabWidth)
+            .opacity(isSelected ? 1.0 : 0.75)
+            .background(isSelected ? Color.primary.opacity(0.08) : Color.clear, in: .capsule)
+            .overlay(
+                Capsule()
+                    .strokeBorder(isSelected ? (tab.currentURL != nil ? faviconColor(for: tab) : Color.accentColor).opacity(0.6) : Color.primary.opacity(0.1), lineWidth: isSelected ? 1.5 : 1.0)
+            )
         }
         .buttonStyle(.plain)
         .id(tab.id)
@@ -438,35 +441,42 @@ struct ContentView: View {
     private var addressBar: some View {
         let expanded = isToolbarExpanded || isAddressBarFocused
 
-        return HStack(spacing: 8) {
-            #if !os(iOS)
-            if expanded {
-                HStack(spacing: 2) {
-                    Button { viewModel.selectedTab?.goBack() } label: {
+        return GlassEffectContainer(spacing: 0) { HStack(spacing: 8) {
+            if expanded && !isAddressBarFocused {
+                HStack(spacing: 0) {
+                    Button {
+                        #if os(iOS)
+                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                        #endif
+                        viewModel.selectedTab?.goBack()
+                    } label: {
                         Image(systemName: "chevron.left")
-                            .font(.system(size: 13, weight: .medium))
-                            .frame(width: 28, height: 28)
-                            .background(
-                                RoundedRectangle(cornerRadius: 6)
-                                    .fill(.quaternary.opacity(0.001))
-                            )
+                            .font(.system(size: 14, weight: .medium))
+                            .frame(width: 36, height: 36)
+                            .contentShape(Rectangle())
                     }
                     .disabled(!(viewModel.selectedTab?.canGoBack ?? false))
 
-                    Button { viewModel.selectedTab?.goForward() } label: {
-                        Image(systemName: "chevron.right")
-                            .font(.system(size: 13, weight: .medium))
-                            .frame(width: 28, height: 28)
-                            .background(
-                                RoundedRectangle(cornerRadius: 6)
-                                    .fill(.quaternary.opacity(0.001))
-                            )
+                    if viewModel.selectedTab?.canGoForward == true {
+                        Button {
+                            #if os(iOS)
+                            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                            #endif
+                            viewModel.selectedTab?.goForward()
+                        } label: {
+                            Image(systemName: "chevron.right")
+                                .font(.system(size: 14, weight: .medium))
+                                .frame(width: 36, height: 36)
+                                .contentShape(Rectangle())
+                        }
+                        .transition(.asymmetric(insertion: .scale(scale: 0.001, anchor: .leading).combined(with: .opacity), removal: .scale(scale: 0.001, anchor: .leading).combined(with: .opacity)))
                     }
-                    .disabled(!(viewModel.selectedTab?.canGoForward ?? false))
                 }
                 .buttonStyle(.plain)
+                .padding(.horizontal, 4)
+                .padding(.vertical, 4)
+                .glassEffect(.regular, in: .capsule)
             }
-            #endif
 
             ZStack {
                 let previewDirection = swipePreviewDirection
@@ -524,8 +534,8 @@ struct ContentView: View {
                 HStack(spacing: 8) {
                     Image(systemName: isAddressBarFocused
                           ? "magnifyingglass"
-                          : (viewModel.selectedTab?.currentURL != nil ? "lock.fill" : "magnifyingglass"))
-                        .foregroundStyle(isAddressBarFocused ? Color.accentColor : Color.secondary)
+                          : (viewModel.selectedTab?.currentURL != nil ? "lock.fill" : (viewModel.isPrivate ? "eye.slash.fill" : "magnifyingglass")))
+                        .foregroundStyle(viewModel.isPrivate && !isAddressBarFocused ? .purple : (isAddressBarFocused ? Color.accentColor : Color.secondary))
                         .font(.system(size: 15, weight: .medium))
                         .frame(width: 18)
                         .contentTransition(.symbolEffect(.replace))
@@ -576,9 +586,9 @@ struct ContentView: View {
                 .allowsHitTesting(expanded)
 
                 HStack(spacing: 4) {
-                    Image(systemName: viewModel.selectedTab?.currentURL != nil ? "lock.fill" : "magnifyingglass")
+                    Image(systemName: viewModel.selectedTab?.currentURL != nil ? "lock.fill" : (viewModel.isPrivate ? "eye.slash.fill" : "magnifyingglass"))
                         .font(.system(size: 10))
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(viewModel.isPrivate ? .purple : .secondary)
                     Text(displayHost(for: addressText))
                         .font(.system(size: 12, weight: .bold))
                         .foregroundStyle(.primary)
@@ -658,25 +668,117 @@ struct ContentView: View {
                     }
                 }
             }
+            .simultaneousGesture(
+                DragGesture(minimumDistance: 15)
+                    .onChanged { value in
+                        if isAddressBarFocused { return }
+                        if abs(value.translation.width) > abs(value.translation.height) {
+                            let resistance = min(abs(value.translation.width) / 1200, 0.1)
+                            let easedTranslation = value.translation.width * (1 - resistance)
+                            addressBarOffset += (easedTranslation - addressBarOffset) * 0.34
+                        }
+                    }
+                    .onEnded { value in
+                        if isAddressBarFocused { return }
 
-            #if !os(iOS)
-            if expanded {
-                HStack(spacing: 4) {
-                    if let url = viewModel.selectedTab?.currentURL {
-                        ShareLink(item: url) {
-                            Image(systemName: "square.and.arrow.up")
-                                .font(.system(size: 13, weight: .medium))
-                                .frame(width: 28, height: 28)
+                        if value.translation.height < -30 || value.predictedEndTranslation.height < -100 {
+                            if abs(value.translation.height) > abs(value.translation.width) {
+                                #if os(iOS)
+                                UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                                #endif
+                                viewModel.snapshotAllTabs()
+                                withAnimation(.spring(duration: 0.45, bounce: 0.12)) {
+                                    showTabOverview = true
+                                }
+                                return
+                            }
+                        }
+
+                        let projectedWidth = value.predictedEndTranslation.width
+                        let translation = value.translation.width
+                        let transitionWidth = max(addressBarWidth, 320)
+                        let triggerDistance = max(addressBarWidth * 0.18, 56)
+                        let canSwipeForward = canCreateNewTabBySwipe || ((selectedTabIndex ?? -1) < (viewModel.tabs.count - 1))
+    
+                        if translation > triggerDistance || projectedWidth > triggerDistance * 1.35 {
+                            #if os(iOS)
+                            let impact = UIImpactFeedbackGenerator(style: .light)
+                            impact.impactOccurred()
+                            #endif
+                            withAnimation(.interactiveSpring(response: 0.26, dampingFraction: 0.94)) {
+                                addressBarOffset = transitionWidth
+                            }
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                                viewModel.selectPreviousTab()
+                                addressBarOffset = -transitionWidth * 0.18
+                                withAnimation(.interactiveSpring(response: 0.46, dampingFraction: 0.9)) {
+                                    addressBarOffset = 0
+                                }
+                            }
+                        } else if canSwipeForward && (translation < -triggerDistance || projectedWidth < -triggerDistance * 1.35) {
+                            #if os(iOS)
+                            let impact = UIImpactFeedbackGenerator(style: .light)
+                            impact.impactOccurred()
+                            #endif
+                            withAnimation(.interactiveSpring(response: 0.26, dampingFraction: 0.94)) {
+                                addressBarOffset = -transitionWidth
+                            }
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                                viewModel.selectNextTab()
+                                addressBarOffset = transitionWidth * 0.18
+                                withAnimation(.interactiveSpring(response: 0.46, dampingFraction: 0.9)) {
+                                    addressBarOffset = 0
+                                }
+                            }
+                        } else {
+                            withAnimation(.interactiveSpring(response: 0.42, dampingFraction: 0.9)) {
+                                addressBarOffset = 0
+                            }
+                        }
+                    }
+            )
+
+            if expanded && !isAddressBarFocused {
+                HStack(spacing: 6) {
+                    Menu {
+                        moreMenuItems
+                    } label: {
+                        Image(systemName: "ellipsis")
+                            .font(.system(size: 15, weight: .medium))
+                            .frame(width: 36, height: 36)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+
+                    if horizontalSizeClass != .compact {
+                        if let url = viewModel.selectedTab?.currentURL {
+                            ShareLink(item: url) {
+                                Image(systemName: "square.and.arrow.up")
+                                    .font(.system(size: 15, weight: .medium))
+                                    .frame(width: 36, height: 36)
+                                    .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                        }
+
+                        Button {
+                            viewModel.snapshotAllTabs()
+                            withAnimation(.spring(duration: 0.45, bounce: 0.12)) {
+                                showTabOverview = true
+                            }
+                        } label: {
+                            Image(systemName: "square.on.square")
+                                .font(.system(size: 15, weight: .medium))
+                                .frame(width: 36, height: 36)
+                                .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
                     }
-
-                    moreMenuDesktop
-
-                    tabOverviewButton
                 }
+                .padding(.horizontal, 6)
+                .padding(.vertical, 4)
+                .glassEffect(.regular, in: .capsule)
             }
-            #endif
 
             if isAddressBarFocused {
                 Button {
@@ -691,7 +793,7 @@ struct ContentView: View {
                 .clipShape(Circle())
                 .transition(.move(edge: .trailing).combined(with: .scale))
             }
-        }
+        } }
         .padding(.horizontal, 12)
         .padding(.top, expanded ? 8 : 2)
         .padding(.bottom, 8)
@@ -707,77 +809,9 @@ struct ContentView: View {
                     }
             }
         }
-        .simultaneousGesture(
-            DragGesture()
-                .onChanged { value in
-                    if isAddressBarFocused { return }
-                    if abs(value.translation.width) > abs(value.translation.height) {
-                        let resistance = min(abs(value.translation.width) / 1200, 0.1)
-                        let easedTranslation = value.translation.width * (1 - resistance)
-                        addressBarOffset += (easedTranslation - addressBarOffset) * 0.34
-                    }
-                }
-                .onEnded { value in
-                    if isAddressBarFocused { return }
-                    let projectedWidth = value.predictedEndTranslation.width
-                    let translation = value.translation.width
-                    let transitionWidth = max(addressBarWidth, 320)
-                    let triggerDistance = max(addressBarWidth * 0.18, 56)
-                    let canSwipeForward = canCreateNewTabBySwipe || ((selectedTabIndex ?? -1) < (viewModel.tabs.count - 1))
-
-                    if translation > triggerDistance || projectedWidth > triggerDistance * 1.35 {
-                        #if os(iOS)
-                        let impact = UIImpactFeedbackGenerator(style: .light)
-                        impact.impactOccurred()
-                        #endif
-                        withAnimation(.interactiveSpring(response: 0.26, dampingFraction: 0.94)) {
-                            addressBarOffset = transitionWidth
-                        }
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                            viewModel.selectPreviousTab()
-                            addressBarOffset = -transitionWidth * 0.18
-                            withAnimation(.interactiveSpring(response: 0.46, dampingFraction: 0.9)) {
-                                addressBarOffset = 0
-                            }
-                        }
-                    } else if canSwipeForward && (translation < -triggerDistance || projectedWidth < -triggerDistance * 1.35) {
-                        #if os(iOS)
-                        let impact = UIImpactFeedbackGenerator(style: .light)
-                        impact.impactOccurred()
-                        #endif
-                        withAnimation(.interactiveSpring(response: 0.26, dampingFraction: 0.94)) {
-                            addressBarOffset = -transitionWidth
-                        }
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                            viewModel.selectNextTab()
-                            addressBarOffset = transitionWidth * 0.18
-                            withAnimation(.interactiveSpring(response: 0.46, dampingFraction: 0.9)) {
-                                addressBarOffset = 0
-                            }
-                        }
-                    } else {
-                        withAnimation(.interactiveSpring(response: 0.42, dampingFraction: 0.9)) {
-                            addressBarOffset = 0
-                        }
-                    }
-                }
-        )
         .animation(.spring(duration: 0.35, bounce: 0.15), value: isAddressBarFocused)
         .animation(.spring(duration: 0.35, bounce: 0.15), value: expanded)
-    }
-
-    private var privateIndicator: some View {
-        HStack(spacing: 4) {
-            Image(systemName: "eye.slash.fill")
-                .font(.system(size: 8, weight: .bold))
-            Text("Private Browsing")
-                .font(.system(size: 9, weight: .bold))
-        }
-        .foregroundStyle(.purple)
-        .padding(.horizontal, 10)
-        .padding(.vertical, 2)
-        .frame(maxWidth: .infinity)
-        .background(Color.purple.opacity(0.08))
+        .animation(.spring(duration: 0.35, bounce: 0.15), value: viewModel.selectedTab?.canGoForward)
     }
 
     private var tabOverviewButton: some View {
@@ -799,6 +833,26 @@ struct ContentView: View {
 
     @ViewBuilder
     private var moreMenuItems: some View {
+        #if os(iOS)
+        if horizontalSizeClass == .compact {
+            Button {
+                viewModel.snapshotAllTabs()
+                withAnimation(.spring(duration: 0.45, bounce: 0.12)) {
+                    showTabOverview = true
+                }
+            } label: {
+                Label("Tab Overview", systemImage: "square.on.square")
+            }
+
+            if let tab = viewModel.selectedTab, let url = tab.currentURL {
+                ShareLink(item: url) {
+                    Label("Share...", systemImage: "square.and.arrow.up")
+                }
+            }
+            Divider()
+        }
+        #endif
+
         if let tab = viewModel.selectedTab, let url = tab.currentURL {
             Button {
                 viewModel.bookmarkStore.toggleBookmark(title: tab.title, url: url)
@@ -975,7 +1029,7 @@ struct ContentView: View {
                     if abs(offset) <= geo.size.width * 1.5 {
                         Group {
                             if tab.currentURL != nil {
-                                WebView(tab: tab, topBarHeight: viewModel.topBarHeight)
+                                WebView(tab: tab, bottomBarHeight: viewModel.bottomBarHeight)
                                     .id(tab.id)
                             } else {
                                 startPage
@@ -1073,8 +1127,8 @@ struct ContentView: View {
                 .frame(maxWidth: 760)
                 .frame(maxWidth: .infinity)
             }
-            .safeAreaInset(edge: .top) {
-                Color.clear.frame(height: viewModel.topBarHeight)
+            .safeAreaInset(edge: .bottom) {
+                Color.clear.frame(height: viewModel.bottomBarHeight)
             }
         }
     }
