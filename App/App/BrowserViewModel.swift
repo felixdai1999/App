@@ -23,12 +23,14 @@ enum TabGroup: String, CaseIterable {
 class BrowserViewModel {
     var activeGroup: TabGroup = .normal
     var bottomBarHeight: CGFloat = 60
+    var topBarHeight: CGFloat = 0
     var normalTabs: [BrowserTab] = []
     var privateTabs: [BrowserTab] = []
     var normalSelectedID: UUID?
     var privateSelectedID: UUID?
     let bookmarkStore = BookmarkStore()
     let historyStore = HistoryStore()
+    let startPageSettings = StartPageSettings()
     @ObservationIgnored private var closedTabs: [(title: String, url: URL)] = []
 
     private static let savedTabsKey = "savedTabURLs"

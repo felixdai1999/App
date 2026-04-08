@@ -6,6 +6,7 @@ import Combine
 struct WebView: UIViewRepresentable {
     let tab: BrowserTab
     let bottomBarHeight: CGFloat
+    var topBarHeight: CGFloat = 0
 
     func makeCoordinator() -> Coordinator {
         Coordinator(tab: tab)
@@ -27,8 +28,8 @@ struct WebView: UIViewRepresentable {
             .compactMap { $0 as? UIWindowScene }
             .first?.windows.first
         let bottomInset = (window?.safeAreaInsets.bottom ?? 0) + bottomBarHeight
-        let topInset = window?.safeAreaInsets.top ?? 0
-        
+        let topInset = (window?.safeAreaInsets.top ?? 0) + topBarHeight
+
         tab.webView.scrollView.contentInset.bottom = bottomInset
         tab.webView.scrollView.verticalScrollIndicatorInsets.bottom = bottomInset
         tab.webView.scrollView.contentInset.top = topInset
@@ -42,8 +43,11 @@ struct WebView: UIViewRepresentable {
             .compactMap { $0 as? UIWindowScene }
             .first?.windows.first
         let bottomInset = (window?.safeAreaInsets.bottom ?? 0) + bottomBarHeight
+        let topInset = (window?.safeAreaInsets.top ?? 0) + topBarHeight
         webView.scrollView.contentInset.bottom = bottomInset
         webView.scrollView.verticalScrollIndicatorInsets.bottom = bottomInset
+        webView.scrollView.contentInset.top = topInset
+        webView.scrollView.verticalScrollIndicatorInsets.top = topInset
     }
 
     class Coordinator: NSObject, UIScrollViewDelegate {
