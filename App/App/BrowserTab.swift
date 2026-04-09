@@ -121,7 +121,7 @@ class BrowserTab: NSObject, Identifiable {
         webView.load(URLRequest(url: url))
     }
 
-    func loadRequest(_ input: String) {
+    func loadRequest(_ input: String, engine: SearchEngine = .google) {
         var text = input.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
 
@@ -135,8 +135,7 @@ class BrowserTab: NSObject, Identifiable {
             }
         }
 
-        let encoded = text.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? text
-        if let url = URL(string: "https://www.google.com/search?q=\(encoded)") {
+        if let url = engine.searchURL(query: text) {
             load(url)
         }
     }

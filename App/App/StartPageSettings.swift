@@ -32,9 +32,73 @@ enum StartPageSection: String, CaseIterable, Codable, Identifiable {
     }
 }
 
+enum QuickActionItem: String, CaseIterable, Codable, Identifiable {
+    case search
+    case bookmarks
+    case history
+    case settings
+    case reopen
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .search: return "Search"
+        case .bookmarks: return "Bookmarks"
+        case .history: return "History"
+        case .settings: return "Settings"
+        case .reopen: return "Reopen"
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .search: return "magnifyingglass"
+        case .bookmarks: return "star.fill"
+        case .history: return "clock.fill"
+        case .settings: return "gearshape.fill"
+        case .reopen: return "arrow.uturn.forward"
+        }
+    }
+}
+
+enum StartPageGradientPreset: String, CaseIterable, Codable, Identifiable {
+    case monochrome
+    case dynamic
+    case ocean
+    case sunset
+    case aurora
+    case midnight
+    case dawn
+    case tropical
+    case candy
+    case neon
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .monochrome: return "Monochrome"
+        case .dynamic: return "Dynamic"
+        case .ocean: return "Ocean"
+        case .sunset: return "Sunset"
+        case .aurora: return "Aurora"
+        case .midnight: return "Midnight"
+        case .dawn: return "Dawn"
+        case .tropical: return "Tropical"
+        case .candy: return "Candy"
+        case .neon: return "Neon"
+        }
+    }
+}
+
 @Observable
 class StartPageSettings {
     var showGreeting: Bool {
+        didSet { save() }
+    }
+
+    var showQuickActions: Bool {
         didSet { save() }
     }
 
@@ -46,15 +110,33 @@ class StartPageSettings {
         didSet { save() }
     }
 
+    var quickActionVisibility: [QuickActionItem: Bool] {
+        didSet { save() }
+    }
+
+    var quickActionOrder: [QuickActionItem] {
+        didSet { save() }
+    }
+
+    var gradientPreset: StartPageGradientPreset {
+        didSet { save() }
+    }
+
     private static let greetingKey = "startPage_showGreeting"
+    private static let quickActionsEnabledKey = "startPage_showQuickActions"
     private static let visibilityKey = "startPage_sectionVisibility"
     private static let orderKey = "startPage_sectionOrder"
+    private static let quickActionsVisibilityKey = "startPage_quickActionVisibility"
+    private static let quickActionsOrderKey = "startPage_quickActionOrder"
+    private static let gradientPresetKey = "startPage_gradientPreset"
 
     init() {
         let defaults = UserDefaults.standard
 
         self.showGreeting = defaults.object(forKey: Self.greetingKey) as? Bool ?? true
+        self.showQuickActions = defaults.object(forKey: Self.quickActionsEnabledKey) as? Bool ?? true
 
+        // Section Visibility
         if let data = defaults.data(forKey: Self.visibilityKey),
            let decoded = try? JSONDecoder().decode([String: Bool].self, from: data) {
             var vis: [StartPageSection: Bool] = [:]
@@ -68,6 +150,7 @@ class StartPageSettings {
             self.sectionVisibility = vis
         }
 
+        // Section Order
         if let data = defaults.data(forKey: Self.orderKey),
            let decoded = try? JSONDecoder().decode([String].self, from: data) {
             let ordered = decoded.compactMap { StartPageSection(rawValue: $0) }
@@ -75,6 +158,37 @@ class StartPageSettings {
             self.sectionOrder = ordered + missing
         } else {
             self.sectionOrder = StartPageSection.allCases
+        }
+
+        // Quick Action Visibility
+        if let data = defaults.data(forKey: Self.quickActionsVisibilityKey),
+           let decoded = try? JSONDecoder().decode([String: Bool].self, from: data) {
+            var vis: [QuickActionItem: Bool] = [:]
+            for item in QuickActionItem.allCases {
+                vis[item] = decoded[item.rawValue] ?? true
+            }
+            self.quickActionVisibility = vis
+        } else {
+            var vis: [QuickActionItem: Bool] = [:]
+            for item in QuickActionItem.allCases { vis[item] = true }
+            self.quickActionVisibility = vis
+        }
+
+        // Quick Action Order
+        if let data = defaults.data(forKey: Self.quickActionsOrderKey),
+           let decoded = try? JSONDecoder().decode([String].self, from: data) {
+            let ordered = decoded.compactMap { QuickActionItem(rawValue: $0) }
+            let missing = QuickActionItem.allCases.filter { !ordered.contains($0) }
+            self.quickActionOrder = ordered + missing
+        } else {
+            self.quickActionOrder = QuickActionItem.allCases
+        }
+
+        if let raw = defaults.string(forKey: Self.gradientPresetKey),
+           let preset = StartPageGradientPreset(rawValue: raw) {
+            self.gradientPreset = preset
+        } else {
+            self.gradientPreset = .monochrome
         }
     }
 
@@ -90,9 +204,22 @@ class StartPageSettings {
         sectionOrder.move(fromOffsets: source, toOffset: destination)
     }
 
+    func isQuickActionVisible(_ item: QuickActionItem) -> Bool {
+        quickActionVisibility[item] ?? true
+    }
+
+    func setQuickActionVisible(_ item: QuickActionItem, _ visible: Bool) {
+        quickActionVisibility[item] = visible
+    }
+
+    func moveQuickAction(from source: IndexSet, to destination: Int) {
+        quickActionOrder.move(fromOffsets: source, toOffset: destination)
+    }
+
     private func save() {
         let defaults = UserDefaults.standard
         defaults.set(showGreeting, forKey: Self.greetingKey)
+        defaults.set(showQuickActions, forKey: Self.quickActionsEnabledKey)
 
         let visDict = Dictionary(uniqueKeysWithValues: sectionVisibility.map { ($0.key.rawValue, $0.value) })
         if let data = try? JSONEncoder().encode(visDict) {
@@ -103,5 +230,17 @@ class StartPageSettings {
         if let data = try? JSONEncoder().encode(orderStrings) {
             defaults.set(data, forKey: Self.orderKey)
         }
+
+        let qaVisDict = Dictionary(uniqueKeysWithValues: quickActionVisibility.map { ($0.key.rawValue, $0.value) })
+        if let data = try? JSONEncoder().encode(qaVisDict) {
+            defaults.set(data, forKey: Self.quickActionsVisibilityKey)
+        }
+
+        let qaOrderStrings = quickActionOrder.map(\.rawValue)
+        if let data = try? JSONEncoder().encode(qaOrderStrings) {
+            defaults.set(data, forKey: Self.quickActionsOrderKey)
+        }
+
+        defaults.set(gradientPreset.rawValue, forKey: Self.gradientPresetKey)
     }
 }

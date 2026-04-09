@@ -1,4 +1,5 @@
 import Foundation
+import SwiftUI
 
 struct Bookmark: Identifiable, Codable, Hashable {
     let id: UUID
@@ -37,6 +38,11 @@ class BookmarkStore {
 
     func removeBookmark(id: UUID) {
         bookmarks.removeAll { $0.id == id }
+        save()
+    }
+
+    func moveBookmark(from source: IndexSet, to destination: Int) {
+        bookmarks.move(fromOffsets: source, toOffset: destination)
         save()
     }
 

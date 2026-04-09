@@ -19,8 +19,72 @@ enum TabGroup: String, CaseIterable {
     }
 }
 
+enum AppTheme: String, CaseIterable, Identifiable {
+    case light
+    case dark
+    case system
+
+    var id: String { rawValue }
+    var label: String { rawValue.capitalized }
+
+    var colorScheme: ColorScheme? {
+        switch self {
+        case .light: return .light
+        case .dark: return .dark
+        case .system: return nil
+        }
+    }
+}
+
+enum SearchEngine: String, CaseIterable, Identifiable {
+    case google
+    case bing
+    case duckduckgo
+    case yahoo
+    case baidu
+
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .google: return "Google"
+        case .bing: return "Bing"
+        case .duckduckgo: return "DuckDuckGo"
+        case .yahoo: return "Yahoo"
+        case .baidu: return "Baidu"
+        }
+    }
+
+    func searchURL(query: String) -> URL? {
+        let encoded = query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? query
+        let urlString: String
+        switch self {
+        case .google: urlString = "https://www.google.com/search?q=\(encoded)"
+        case .bing: urlString = "https://www.bing.com/search?q=\(encoded)"
+        case .duckduckgo: urlString = "https://duckduckgo.com/?q=\(encoded)"
+        case .yahoo: urlString = "https://search.yahoo.com/search?p=\(encoded)"
+        case .baidu: urlString = "https://www.baidu.com/s?wd=\(encoded)"
+        }
+        return URL(string: urlString)
+    }
+}
+
 @Observable
 class BrowserViewModel {
+    var theme: AppTheme = .system {
+        didSet {
+            UserDefaults.standard.set(theme.rawValue, forKey: "appTheme")
+        }
+    }
+    var searchEngine: SearchEngine = .google {
+        didSet {
+            UserDefaults.standard.set(searchEngine.rawValue, forKey: "searchEngine")
+        }
+    }
+    var showTabStrip: Bool = true {
+        didSet {
+            UserDefaults.standard.set(showTabStrip, forKey: "showTabStrip")
+        }
+    }
     var activeGroup: TabGroup = .normal
     var bottomBarHeight: CGFloat = 60
     var topBarHeight: CGFloat = 0
@@ -29,6 +93,7 @@ class BrowserViewModel {
     var normalSelectedID: UUID?
     var privateSelectedID: UUID?
     let bookmarkStore = BookmarkStore()
+    let favoriteStore = FavoriteStore()
     let historyStore = HistoryStore()
     let startPageSettings = StartPageSettings()
     @ObservationIgnored private var closedTabs: [(title: String, url: URL)] = []
@@ -65,6 +130,15 @@ class BrowserViewModel {
     }
 
     init() {
+        if let savedTheme = UserDefaults.standard.string(forKey: "appTheme"),
+           let theme = AppTheme(rawValue: savedTheme) {
+            self.theme = theme
+        }
+        if let savedEngine = UserDefaults.standard.string(forKey: "searchEngine"),
+           let engine = SearchEngine(rawValue: savedEngine) {
+            self.searchEngine = engine
+        }
+        self.showTabStrip = UserDefaults.standard.object(forKey: "showTabStrip") as? Bool ?? true
         restoreTabs()
     }
 
