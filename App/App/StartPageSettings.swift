@@ -33,31 +33,35 @@ enum StartPageSection: String, CaseIterable, Codable, Identifiable {
 }
 
 enum QuickActionItem: String, CaseIterable, Codable, Identifiable {
+    /// Declaration order is the default quick-action order for new installs and `allCases`.
     case search
+    case favorites
     case bookmarks
     case history
+    case tabOverview
     case settings
-    case reopen
 
     var id: String { rawValue }
 
     var label: String {
         switch self {
         case .search: return "Search"
+        case .favorites: return "Favorites"
         case .bookmarks: return "Bookmarks"
         case .history: return "History"
+        case .tabOverview: return "Tabs"
         case .settings: return "Settings"
-        case .reopen: return "Reopen"
         }
     }
 
     var icon: String {
         switch self {
         case .search: return "magnifyingglass"
+        case .favorites: return "heart.fill"
         case .bookmarks: return "star.fill"
         case .history: return "clock.fill"
+        case .tabOverview: return "square.on.square"
         case .settings: return "gearshape.fill"
-        case .reopen: return "arrow.uturn.forward"
         }
     }
 }

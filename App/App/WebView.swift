@@ -3,6 +3,16 @@ import WebKit
 import Combine
 
 #if os(iOS) || os(visionOS)
+private func resolvedWindowSafeAreaInsets(for webView: WKWebView) -> UIEdgeInsets {
+    if let window = webView.window {
+        return window.safeAreaInsets
+    }
+    let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+    let scene = scenes.first(where: { $0.activationState == .foregroundActive }) ?? scenes.first
+    let window = scene?.windows.first(where: \.isKeyWindow) ?? scene?.windows.first
+    return window?.safeAreaInsets ?? .zero
+}
+
 struct WebView: UIViewRepresentable {
     let tab: BrowserTab
     let bottomBarHeight: CGFloat
@@ -24,11 +34,9 @@ struct WebView: UIViewRepresentable {
         tab.webView.scrollView.contentInsetAdjustmentBehavior = .never
 
         // Add bottom inset so content isn't hidden behind safe area
-        let window = UIApplication.shared.connectedScenes
-            .compactMap { $0 as? UIWindowScene }
-            .first?.windows.first
-        let bottomInset = (window?.safeAreaInsets.bottom ?? 0) + bottomBarHeight
-        let topInset = (window?.safeAreaInsets.top ?? 0) + topBarHeight
+        let windowInsets = resolvedWindowSafeAreaInsets(for: tab.webView)
+        let bottomInset = windowInsets.bottom + bottomBarHeight
+        let topInset = windowInsets.top + topBarHeight
 
         tab.webView.scrollView.contentInset.bottom = bottomInset
         tab.webView.scrollView.verticalScrollIndicatorInsets.bottom = bottomInset
@@ -39,11 +47,9 @@ struct WebView: UIViewRepresentable {
     }
 
     func updateUIView(_ webView: WKWebView, context: Context) {
-        let window = UIApplication.shared.connectedScenes
-            .compactMap { $0 as? UIWindowScene }
-            .first?.windows.first
-        let bottomInset = (window?.safeAreaInsets.bottom ?? 0) + bottomBarHeight
-        let topInset = (window?.safeAreaInsets.top ?? 0) + topBarHeight
+        let windowInsets = resolvedWindowSafeAreaInsets(for: webView)
+        let bottomInset = windowInsets.bottom + bottomBarHeight
+        let topInset = windowInsets.top + topBarHeight
         webView.scrollView.contentInset.bottom = bottomInset
         webView.scrollView.verticalScrollIndicatorInsets.bottom = bottomInset
         webView.scrollView.contentInset.top = topInset

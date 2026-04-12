@@ -56,6 +56,7 @@ struct ContentView: View {
     @Environment(\.verticalSizeClass) private var verticalSizeClass
 
     private var shouldShowTabStrip: Bool {
+        guard viewModel.tabs.count > 1 else { return false }
         #if os(iOS)
         let isEligibleClass = horizontalSizeClass == .regular || verticalSizeClass == .compact
         return isEligibleClass && isToolbarExpanded && viewModel.showTabStrip
@@ -75,9 +76,12 @@ struct ContentView: View {
     var body: some View {
         ZStack {
             browserView
-                .scaleEffect(showTabOverview ? 0.92 : 1)
                 .opacity(showTabOverview ? 0 : 1)
                 .allowsHitTesting(!showTabOverview)
+
+            if showStartPageOverlay && addressBarOnTop {
+                floatingStartPageOverlay
+            }
 
             if showTabOverview {
                 tabOverview
@@ -382,16 +386,10 @@ struct ContentView: View {
                 .padding(.horizontal, 3)
                 .padding(.vertical, 3)
             }
+            .coordinateSpace(name: "tabStripScroll")
             .clipShape(Capsule())
             .glassEffect(.regular, in: .capsule)
             .padding(.horizontal, 10)
-            .onChange(of: viewModel.selectedTabID) { _, newID in
-                if let id = newID {
-                    withAnimation(.easeInOut(duration: 0.2)) {
-                        proxy.scrollTo(id, anchor: .center)
-                    }
-                }
-            }
         }
     }
 
@@ -406,10 +404,7 @@ struct ContentView: View {
             }
         } label: {
             HStack(spacing: 5) {
-                if isSelected {
-                    // Balancing space for the close button
-                    Color.clear.frame(width: 14, height: 14)
-                }
+
 
                 Spacer(minLength: 0)
 
@@ -450,11 +445,23 @@ struct ContentView: View {
                     .buttonStyle(.plain)
                 }
             }
-            .padding(.horizontal, 8)
+            .padding(.leading, isSelected ? 4 : 8)
+            .padding(.trailing, 8)
             .padding(.vertical, 7)
             .frame(width: tabWidth)
             .contentShape(Rectangle())
-            .background(isSelected ? Color.primary.opacity(0.08) : Color.clear, in: .capsule)
+            .background {
+                if isSelected {
+                    Capsule()
+                        .fill(.ultraThinMaterial)
+                        .overlay(
+                            Capsule()
+                                .strokeBorder(.primary.opacity(0.12), lineWidth: 0.5)
+                        )
+                        .shadow(color: .black.opacity(0.10), radius: 6, x: 0, y: 2)
+                        .shadow(color: .black.opacity(0.06), radius: 2, x: 0, y: 1)
+                }
+            }
             .overlay(alignment: .trailing) {
                 if !isLast && !isSelected && !nextIsSelected {
                     Rectangle()
@@ -466,6 +473,24 @@ struct ContentView: View {
         }
         .buttonStyle(.plain)
         .id(tab.id)
+        .zIndex(isSelected ? 10 : 0)
+        .visualEffect { content, proxy in
+            let offset: CGFloat = {
+                guard isSelected else { return 0 }
+                let frame = proxy.frame(in: .named("tabStripScroll"))
+                let visibleWidth = max(0, bottomContainerWidth - 20)
+                let edgePadding: CGFloat = 3
+                
+                if frame.minX < edgePadding {
+                    return edgePadding - frame.minX
+                } else if frame.maxX > visibleWidth - edgePadding {
+                    return (visibleWidth - edgePadding) - frame.maxX
+                }
+                return 0
+            }()
+            
+            return content.offset(x: offset)
+        }
         .contextMenu {
             if let url = tab.currentURL {
                 Button {
@@ -581,6 +606,13 @@ struct ContentView: View {
         let expanded = isToolbarExpanded || isAddressBarFocused
 
         return GlassEffectContainer(spacing: 0) { HStack(spacing: 8) {
+            if isAddressBarFocused && addressBarOnTop {
+                // Spacer to balance the close button on the right for centering
+                Spacer()
+                    .frame(width: 32 + 8) // xmark frame width (32) + HStack spacing (8)
+                    .allowsHitTesting(false)
+            }
+
             if expanded && !isAddressBarFocused {
                 HStack(spacing: 0) {
 
@@ -1027,6 +1059,7 @@ struct ContentView: View {
         .padding(.horizontal, 12)
         .padding(.top, expanded ? 8 : (addressBarOnTop ? 8 : 4))
         .padding(.bottom, expanded ? 4 : (addressBarOnTop ? 6 : 2))
+        .frame(maxWidth: isAddressBarFocused && addressBarOnTop ? 720 : .infinity)
         .frame(maxWidth: .infinity)
         .background {
             if !expanded {
@@ -1297,11 +1330,16 @@ struct ContentView: View {
             .frame(width: geo.size.width, height: geo.size.height, alignment: .top)
             .clipped()
 
-            if showStartPageOverlay {
-                Color(uiColor: .systemBackground)
-                    .frame(width: geo.size.width, height: geo.size.height)
-                    .ignoresSafeArea()
-                    .transition(.opacity)
+            if showStartPageOverlay && !addressBarOnTop {
+                ZStack {
+                    Rectangle()
+                        .fill(.black.opacity(0.12))
+                    Rectangle()
+                        .fill(.ultraThinMaterial)
+                }
+                .frame(width: geo.size.width, height: geo.size.height)
+                .ignoresSafeArea()
+                .transition(.opacity)
 
                 startPage
                     .frame(width: geo.size.width, height: geo.size.height)
@@ -1323,7 +1361,52 @@ struct ContentView: View {
         .animation(.interactiveSpring(response: 0.4, dampingFraction: 0.88, blendDuration: 0.18), value: viewModel.selectedTabID)
     }
 
+    private var floatingStartPageOverlay: some View {
+        ZStack(alignment: .top) {
+            VStack(spacing: 0) {
+                // Invisible gap to keep address bar accessible
+                Color.clear
+                    .frame(height: viewModel.topBarHeight)
+                    .allowsHitTesting(false)
+                
+                // Floating liquid glass window
+                ZStack(alignment: .top) {
+                    startPage
+                        .clipShape(RoundedRectangle(cornerRadius: 32, style: .continuous))
+                }
+                .frame(maxWidth: 760)
+                .frame(maxHeight: 680)
+                .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 32, style: .continuous))
+                .shadow(color: .black.opacity(0.26), radius: 60, x: 0, y: 25)
+                .shadow(color: .black.opacity(0.12), radius: 20, x: 0, y: 10)
+                .overlay {
+                    RoundedRectangle(cornerRadius: 32, style: .continuous)
+                        .strokeBorder(.white.opacity(0.12), lineWidth: 0.5)
+                }
+                .frame(width: addressBarWidth > 0 ? addressBarWidth : 720)
+                .frame(maxHeight: 680)
+                .padding(.top, 12)
+                .transition(
+                    .asymmetric(
+                        insertion: .opacity
+                            .combined(with: .offset(y: -20))
+                            .combined(with: .scale(scale: 0.98)),
+                        removal: .opacity
+                            .combined(with: .scale(scale: 0.985))
+                    )
+                )
+            }
+        }
+        .ignoresSafeArea(.keyboard)
+        .zIndex(100)
+    }
+
     // MARK: - Start Page
+
+    private enum StartPageSectionSpacing {
+        /// Space above each section card (after quick actions or following another section).
+        static let beforeCard: CGFloat = 12
+    }
 
     private var startPage: some View {
         let settings = viewModel.startPageSettings
@@ -1331,109 +1414,123 @@ struct ContentView: View {
             startPageBackground
 
             ScrollView {
-                VStack(spacing: 0) {
-                    Spacer(minLength: startPageTopPadding)
+                GlassEffectContainer(spacing: 16) {
+                    VStack(spacing: 0) {
+                        Spacer(minLength: startPageTopPadding)
 
-                    if isCompactStartPage {
-                        // Portrait iPhone: centered greeting + actions below
-                        if settings.showGreeting {
-                            VStack(spacing: 4) {
-                                Text(greeting)
-                                    .font(.system(size: 28, weight: .bold, design: .rounded))
-                                    .foregroundStyle(
-                                        .linearGradient(
-                                            colors: [startPageGradientColors.0, startPageGradientColors.1],
-                                            startPoint: .topLeading,
-                                            endPoint: .bottomTrailing
-                                        )
-                                    )
-
-                                Text(formattedDate)
-                                    .font(.system(size: 13, weight: .semibold, design: .rounded))
-                                    .foregroundStyle(.tertiary)
-                                    .textCase(.uppercase)
-                                    .tracking(1.2)
-                            }
-                            .transition(.opacity.combined(with: .scale(scale: 0.95)))
-                        }
-
-                        startPageQuickActions
-                            .padding(.top, settings.showGreeting ? 18 : 8)
-                            .padding(.horizontal, 24)
-                    } else {
-                        // Landscape / iPad / macOS: left-aligned, same row
-                        HStack(alignment: .firstTextBaseline) {
-                            if settings.showGreeting {
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(greeting)
-                                        .font(.system(size: 24, weight: .bold, design: .rounded))
-                                        .foregroundStyle(
-                                            .linearGradient(
-                                                colors: [startPageGradientColors.0, startPageGradientColors.1],
-                                                startPoint: .topLeading,
-                                                endPoint: .bottomTrailing
-                                            )
-                                        )
-
-                                    Text(formattedDate)
-                                        .font(.system(size: 12, weight: .semibold, design: .rounded))
-                                        .foregroundStyle(.tertiary)
-                                        .textCase(.uppercase)
-                                        .tracking(1.2)
+                        if isCompactStartPage {
+                            // Portrait: greeting card + quick actions share the same horizontal inset and width.
+                            VStack(spacing: 12) {
+                                if settings.showGreeting {
+                                    startPageGreetingContent(large: true)
+                                        .multilineTextAlignment(.center)
+                                        .frame(maxWidth: .infinity)
+                                        .padding(.vertical, 14)
+                                        .padding(.horizontal, 18)
+                                        .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 32, style: .continuous))
+                                        .overlay {
+                                            RoundedRectangle(cornerRadius: 32, style: .continuous)
+                                                .strokeBorder(Color.white.opacity(0.14), lineWidth: 0.5)
+                                        }
+                                        .transition(.opacity.combined(with: .scale(scale: 0.96)))
                                 }
-                                .transition(.opacity.combined(with: .scale(scale: 0.95)))
+
+                                startPageQuickActions
+                                    .frame(maxWidth: .infinity)
                             }
+                            .padding(.horizontal, 20)
+                            .padding(.top, !settings.showGreeting && settings.showQuickActions ? 8 : 0)
+                        } else {
+                            // Landscape / iPad / macOS: greeting card and quick bar share the same max width when both show.
+                            HStack(alignment: .center, spacing: 16) {
+                                if settings.showGreeting {
+                                    startPageGreetingContent(large: false)
+                                        .frame(maxWidth: startPageLandscapeGreetingCardMaxWidth, alignment: .leading)
+                                        .padding(.vertical, 11)
+                                        .padding(.horizontal, startPageLandscapeGreetingHorizontalPadding)
+                                        .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 26, style: .continuous))
+                                        .overlay {
+                                            RoundedRectangle(cornerRadius: 26, style: .continuous)
+                                                .strokeBorder(Color.white.opacity(0.14), lineWidth: 0.5)
+                                        }
+                                        .transition(.opacity.combined(with: .scale(scale: 0.96)))
+                                }
 
-                            Spacer()
+                                Spacer(minLength: 8)
 
-                            startPageQuickActions
+                                startPageQuickActions
+                                    .frame(maxWidth: settings.showGreeting ? startPageLandscapeGreetingCardOuterWidth : .infinity)
+                            }
+                            .padding(.horizontal, 20)
                         }
-                        .padding(.horizontal, 24)
-                    }
 
-                    ForEach(settings.sectionOrder) { section in
-                        startPageSectionView(for: section)
-                            .transition(.opacity.combined(with: .move(edge: .top)))
-                    }
-
-                    // Customize button
-                    Button {
-                        #if os(iOS)
-                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                        #endif
-                        showCustomizeStartPage = true
-                    } label: {
-                        HStack(spacing: 6) {
-                            Image(systemName: "slider.horizontal.3")
-                                .font(.system(size: 12, weight: .semibold))
-                            Text("Customize")
-                                .font(.system(size: 13, weight: .semibold))
+                        ForEach(settings.sectionOrder) { section in
+                            startPageSectionView(for: section)
+                                .transition(.opacity.combined(with: .move(edge: .top)))
                         }
-                        .foregroundStyle(.secondary)
-                        .padding(.horizontal, 16)
-                        .padding(.vertical, 10)
-                        .glassEffect(.regular, in: .capsule)
-                    }
-                    .buttonStyle(PressableButtonStyle())
-                    .padding(.top, 36)
 
-                    Spacer(minLength: 50)
+                        // Customize button
+                        Button {
+                            #if os(iOS)
+                            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                            #endif
+                            showCustomizeStartPage = true
+                        } label: {
+                            HStack(spacing: 6) {
+                                Image(systemName: "slider.horizontal.3")
+                                    .font(.system(size: 12, weight: .semibold))
+                                Text("Customize")
+                                    .font(.system(size: 13, weight: .semibold))
+                            }
+                            .foregroundStyle(.secondary)
+                            .padding(.horizontal, 16)
+                            .padding(.vertical, 10)
+                            .glassEffect(.regular, in: .capsule)
+                        }
+                        .buttonStyle(PressableButtonStyle())
+                        .padding(.top, StartPageSectionSpacing.beforeCard)
+
+                        Spacer(minLength: 50)
+                    }
+                    .frame(maxWidth: 720)
+                    .frame(maxWidth: .infinity)
+                    .animation(.spring(duration: 0.4, bounce: 0.15), value: settings.sectionOrder.map(\.rawValue))
+                    .animation(.spring(duration: 0.35, bounce: 0.1), value: settings.showGreeting)
                 }
-                .frame(maxWidth: 720)
-                .frame(maxWidth: .infinity)
-                .animation(.spring(duration: 0.4, bounce: 0.15), value: settings.sectionOrder.map(\.rawValue))
-                .animation(.spring(duration: 0.35, bounce: 0.1), value: settings.showGreeting)
             }
             .scrollIndicators(.hidden)
             .safeAreaInset(edge: .bottom) {
                 Color.clear.frame(height: viewModel.bottomBarHeight)
             }
             .safeAreaInset(edge: .top) {
-                Color.clear.frame(height: viewModel.topBarHeight)
+                if !showStartPageOverlay || !addressBarOnTop {
+                    Color.clear.frame(height: viewModel.topBarHeight)
+                }
             }
         }
         .sheet(isPresented: $showCustomizeStartPage) {
             customizeStartPageSheet
+        }
+    }
+
+    @ViewBuilder
+    private func startPageGreetingContent(large: Bool) -> some View {
+        VStack(spacing: large ? 4 : 3) {
+            Text(greeting)
+                .font(.system(size: large ? 26 : 20, weight: .bold, design: .rounded))
+                .foregroundStyle(
+                    .linearGradient(
+                        colors: [startPageGradientColors.0, startPageGradientColors.1],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                )
+
+            Text(formattedDate)
+                .font(.system(size: large ? 11 : 10, weight: .semibold, design: .rounded))
+                .foregroundStyle(.secondary)
+                .textCase(.uppercase)
+                .tracking(large ? 1.15 : 1.0)
         }
     }
 
@@ -1447,22 +1544,14 @@ struct ContentView: View {
             }
         case .bookmarks:
             if settings.isSectionVisible(section) && !viewModel.bookmarkStore.bookmarks.isEmpty {
-                VStack(alignment: .leading, spacing: 14) {
+                VStack(alignment: .leading, spacing: 10) {
                     HStack {
                         sectionHeader("BOOKMARKS")
                         Spacer()
-                        Button {
+                        startPageSectionManageButton {
                             selectedCollectionTab = .bookmarks
                             showBookmarks = true
-                        } label: {
-                            Text("Manage")
-                                .font(.system(size: 11, weight: .bold, design: .rounded))
-                                .foregroundStyle(.secondary)
-                                .padding(.horizontal, 10)
-                                .padding(.vertical, 7)
-                                .glassEffect(.regular, in: .capsule)
                         }
-                        .buttonStyle(PressableButtonStyle())
                     }
 
                     LazyVGrid(
@@ -1474,27 +1563,27 @@ struct ContentView: View {
                         }
                     }
                 }
-                .padding(.horizontal, 24)
-                .padding(.top, 32)
+                .padding(.horizontal, 18)
+                .padding(.top, 12)
+                .padding(.bottom, 18)
+                .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 26, style: .continuous))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 26, style: .continuous)
+                        .strokeBorder(Color.white.opacity(0.12), lineWidth: 0.5)
+                }
+                .padding(.horizontal, 20)
+                .padding(.top, StartPageSectionSpacing.beforeCard)
             }
         case .favorites:
             if settings.isSectionVisible(section) {
-                VStack(alignment: .leading, spacing: 14) {
+                VStack(alignment: .leading, spacing: 10) {
                     HStack {
                         sectionHeader("FAVORITES")
                         Spacer()
-                        Button {
+                        startPageSectionManageButton {
                             selectedCollectionTab = .favorites
                             showBookmarks = true
-                        } label: {
-                            Text("Manage")
-                                .font(.system(size: 11, weight: .bold, design: .rounded))
-                                .foregroundStyle(.secondary)
-                                .padding(.horizontal, 10)
-                                .padding(.vertical, 7)
-                                .glassEffect(.regular, in: .capsule)
                         }
-                        .buttonStyle(PressableButtonStyle())
                     }
 
                     LazyVGrid(
@@ -1506,8 +1595,16 @@ struct ContentView: View {
                         }
                     }
                 }
-                .padding(.horizontal, 24)
-                .padding(.top, 28)
+                .padding(.horizontal, 18)
+                .padding(.top, 12)
+                .padding(.bottom, 18)
+                .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 26, style: .continuous))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 26, style: .continuous)
+                        .strokeBorder(Color.white.opacity(0.12), lineWidth: 0.5)
+                }
+                .padding(.horizontal, 20)
+                .padding(.top, StartPageSectionSpacing.beforeCard)
             }
         }
     }
@@ -1517,7 +1614,24 @@ struct ContentView: View {
             .font(.system(size: 11, weight: .heavy, design: .rounded))
             .foregroundStyle(.tertiary)
             .tracking(1.8)
-            .padding(.horizontal, 4)
+    }
+
+    private func startPageSectionManageButton(action: @escaping () -> Void) -> some View {
+        Button {
+            #if os(iOS)
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            #endif
+            action()
+        } label: {
+            Image(systemName: "square.and.pencil")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .frame(width: 28, height: 28)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(PressableButtonStyle())
+        .glassEffect(.regular, in: .circle)
+        .accessibilityLabel("Manage")
     }
 
     private var customizeStartPageSheet: some View {
@@ -1672,22 +1786,14 @@ struct ContentView: View {
     }
 
     private var recentlyVisitedSection: some View {
-        VStack(alignment: .leading, spacing: 14) {
+        VStack(alignment: .leading, spacing: 10) {
             HStack {
                 sectionHeader("RECENTLY VISITED")
                 Spacer()
-                Button {
+                startPageSectionManageButton {
                     selectedCollectionTab = .history
                     showBookmarks = true
-                } label: {
-                    Text("Manage")
-                        .font(.system(size: 11, weight: .bold, design: .rounded))
-                        .foregroundStyle(.secondary)
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 7)
-                        .glassEffect(.regular, in: .capsule)
                 }
-                .buttonStyle(PressableButtonStyle())
             }
 
             LazyVGrid(
@@ -1729,8 +1835,16 @@ struct ContentView: View {
                 }
             }
         }
-        .padding(.horizontal, 24)
-        .padding(.top, 32)
+        .padding(.horizontal, 18)
+        .padding(.top, 12)
+        .padding(.bottom, 18)
+        .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 26, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 26, style: .continuous)
+                .strokeBorder(Color.white.opacity(0.12), lineWidth: 0.5)
+        }
+        .padding(.horizontal, 20)
+        .padding(.top, StartPageSectionSpacing.beforeCard)
     }
 
     private func hostLabel(for url: URL) -> String {
@@ -1739,105 +1853,198 @@ struct ContentView: View {
         return cleaned.components(separatedBy: ".").first?.capitalized ?? cleaned
     }
 
+    private var startPageAmbientBaseGradient: [Color] {
+        #if os(iOS) || os(visionOS)
+        [
+            Color(uiColor: .secondarySystemBackground),
+            Color(uiColor: .systemBackground)
+        ]
+        #elseif os(macOS)
+        [
+            Color(nsColor: .controlBackgroundColor),
+            Color(nsColor: .windowBackgroundColor)
+        ]
+        #else
+        [Color.gray.opacity(0.18), Color.gray.opacity(0.06)]
+        #endif
+    }
+
     private var startPageBackground: some View {
-        let (c1, c2) = startPageGradientColors
-        return ZStack {
+        Group {
+            if showStartPageOverlay && addressBarOnTop {
+                Color.clear
+            } else {
+                let (c1, c2) = startPageGradientColors
+                ZStack {
+            LinearGradient(
+                colors: startPageAmbientBaseGradient,
+                startPoint: .top,
+                endPoint: .bottom
+            )
+            .opacity(0.35)
+
             // Primary ambient glow — top left
             RadialGradient(
-                colors: [c1.opacity(0.34), c1.opacity(0.13), .clear],
+                colors: [c1.opacity(0.38), c1.opacity(0.15), .clear],
                 center: .topLeading,
                 startRadius: 40,
-                endRadius: 550
+                endRadius: 560
             )
 
             // Secondary ambient glow — bottom right
             RadialGradient(
-                colors: [c2.opacity(0.30), c2.opacity(0.12), .clear],
+                colors: [c2.opacity(0.34), c2.opacity(0.14), .clear],
                 center: .bottomTrailing,
                 startRadius: 30,
-                endRadius: 500
+                endRadius: 520
             )
 
             // Soft center blend
             RadialGradient(
-                colors: [c1.opacity(0.08), c2.opacity(0.07), .clear],
+                colors: [c1.opacity(0.10), c2.opacity(0.09), .clear],
                 center: .center,
                 startRadius: 10,
-                endRadius: 400
+                endRadius: 420
             )
 
             // Subtle top-center highlight for depth
             RadialGradient(
-                colors: [.white.opacity(0.025), .clear],
+                colors: [.white.opacity(0.06), .clear],
                 center: .top,
-                startRadius: 10,
-                endRadius: 300
+                startRadius: 20,
+                endRadius: 340
             )
+
+            // Liquid edge sheen
+            RadialGradient(
+                colors: [c1.opacity(0.12), .clear],
+                center: .leading,
+                startRadius: 0,
+                endRadius: 280
+            )
+                }
+                .ignoresSafeArea()
+            }
         }
-        .ignoresSafeArea()
+    }
+
+    private var visibleQuickActionItems: [QuickActionItem] {
+        let settings = viewModel.startPageSettings
+        return settings.quickActionOrder.filter { settings.isQuickActionVisible($0) }
+    }
+
+    /// Inner content width for the landscape greeting card (before horizontal padding).
+    private var startPageLandscapeGreetingCardMaxWidth: CGFloat { 280 }
+    private var startPageLandscapeGreetingHorizontalPadding: CGFloat { 14 }
+
+    /// Total width of the landscape greeting glass card (content + horizontal padding on each side).
+    private var startPageLandscapeGreetingCardOuterWidth: CGFloat {
+        startPageLandscapeGreetingCardMaxWidth + startPageLandscapeGreetingHorizontalPadding * 2
+    }
+
+    private enum StartPageQuickActionMetrics {
+        static let rowContentHeight: CGFloat = 38
+        static let chromePaddingHorizontal: CGFloat = 5
+        static let chromePaddingVertical: CGFloat = 3
+        /// Separator height between slots (centered in the row, shorter than full bar height).
+        static let dividerHeight: CGFloat = 24
+        /// Below this per-slot width (after dividers), labels hide and only icons show — single row, fixed height.
+        static let minSlotWidthForCaption: CGFloat = 52
+        static var totalRowHeight: CGFloat { rowContentHeight + chromePaddingVertical * 2 }
     }
 
     private var startPageQuickActions: some View {
         let settings = viewModel.startPageSettings
+        let items = visibleQuickActionItems
         return Group {
-            if settings.showQuickActions {
-                HStack(spacing: 8) {
-                    ForEach(settings.quickActionOrder) { item in
-                        if settings.isQuickActionVisible(item) {
-                            switch item {
-                            case .search:
-                                startPagePill("Search", icon: "magnifyingglass") {
-                                    isAddressBarFocused = true
-                                }
-                            case .bookmarks:
-                                startPagePill("Bookmarks", icon: "star.fill") {
-                                    selectedCollectionTab = .bookmarks
-                                    showBookmarks = true
-                                }
-                            case .history:
-                                startPagePill("History", icon: "clock.fill") {
-                                    selectedCollectionTab = .history
-                                    showBookmarks = true
-                                }
-                            case .settings:
-                                startPagePill("Settings", icon: "gearshape.fill") {
-                                    showSettings = true
-                                }
-                            case .reopen:
-                                if viewModel.canReopenTab {
-                                    startPagePill("Reopen", icon: "arrow.uturn.forward") {
-                                        withAnimation(.snappy(duration: 0.25)) {
-                                            viewModel.reopenLastClosedTab()
-                                        }
-                                    }
-                                }
+            if settings.showQuickActions && !items.isEmpty {
+                GeometryReader { geo in
+                    let chromeH = StartPageQuickActionMetrics.chromePaddingHorizontal
+                    let chromeV = StartPageQuickActionMetrics.chromePaddingVertical
+                    let inner = max(geo.size.width - chromeH * 2, 1)
+                    let n = items.count
+                    let dividerCount = max(0, n - 1)
+                    let slot = (inner - CGFloat(dividerCount)) / CGFloat(max(n, 1))
+                    let showIconsOnly = slot < StartPageQuickActionMetrics.minSlotWidthForCaption
+
+                    HStack(spacing: 0) {
+                        ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
+                            if index > 0 {
+                                Rectangle()
+                                    .fill(Color.primary.opacity(0.08))
+                                    .frame(width: 1, height: StartPageQuickActionMetrics.dividerHeight)
                             }
+                            startPageQuickActionCell(item: item, showIconsOnly: showIconsOnly)
+                                .frame(maxWidth: .infinity)
                         }
                     }
+                    .padding(.horizontal, chromeH)
+                    .padding(.vertical, chromeV)
+                    .frame(width: geo.size.width, height: geo.size.height)
+                    .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 22, style: .continuous)
+                            .strokeBorder(Color.white.opacity(0.14), lineWidth: 0.5)
+                    }
                 }
+                .frame(maxWidth: .infinity)
+                .frame(height: StartPageQuickActionMetrics.totalRowHeight)
             }
         }
     }
 
-    private func startPagePill(_ label: String, icon: String, action: @escaping () -> Void) -> some View {
+    private func startPageQuickActionCell(item: QuickActionItem, showIconsOnly: Bool) -> some View {
         Button {
-            #if os(iOS)
-            UIImpactFeedbackGenerator(style: .light).impactOccurred()
-            #endif
-            action()
+            performStartPageQuickAction(item)
         } label: {
-            HStack(spacing: 4) {
-                Image(systemName: icon)
-                    .font(.system(size: 9, weight: .semibold))
-                Text(label)
-                    .font(.system(size: 11, weight: .semibold))
+            Group {
+                if showIconsOnly {
+                    Image(systemName: item.icon)
+                        .font(.system(size: 15, weight: .semibold))
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    VStack(spacing: 2) {
+                        Image(systemName: item.icon)
+                            .font(.system(size: 11, weight: .semibold))
+                        Text(item.label)
+                            .font(.system(size: 10, weight: .semibold, design: .rounded))
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.72)
+                    }
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
             }
             .foregroundStyle(.secondary)
-            .padding(.horizontal, 10)
-            .padding(.vertical, 7)
-            .glassEffect(.regular, in: .capsule)
+            .frame(maxHeight: .infinity)
+            .contentShape(Rectangle())
         }
         .buttonStyle(PressableButtonStyle())
+    }
+
+    private func performStartPageQuickAction(_ item: QuickActionItem) {
+        #if os(iOS)
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        #endif
+        switch item {
+        case .search:
+            isAddressBarFocused = true
+        case .tabOverview:
+            withAnimation(.spring(duration: 0.45, bounce: 0.12)) {
+                showTabOverview = true
+            }
+        case .bookmarks:
+            selectedCollectionTab = .bookmarks
+            showBookmarks = true
+        case .history:
+            selectedCollectionTab = .history
+            showBookmarks = true
+        case .favorites:
+            selectedCollectionTab = .favorites
+            showBookmarks = true
+        case .settings:
+            showSettings = true
+        }
     }
 
     private var isCompactStartPage: Bool {
@@ -1849,6 +2056,9 @@ struct ContentView: View {
     }
 
     private var startPageTopPadding: CGFloat {
+        if showStartPageOverlay && addressBarOnTop {
+            return 12
+        }
         #if os(iOS)
         if horizontalSizeClass == .regular || verticalSizeClass == .compact {
             return 30
@@ -1954,7 +2164,7 @@ struct ContentView: View {
                         tabCard(for: tab)
                             .transition(.scale(scale: 0.8).combined(with: .opacity))
                             .draggable(tab.id.uuidString) {
-                                RoundedRectangle(cornerRadius: 14)
+                                RoundedRectangle(cornerRadius: 22)
                                     .fill(.quaternary)
                                     .frame(width: 120, height: 160)
                                     .overlay(
@@ -2085,30 +2295,37 @@ struct ContentView: View {
                 showTabOverview = false
             }
         } label: {
-            VStack(spacing: 0) {
+            VStack(spacing: 10) {
                 ZStack {
-                    Rectangle()
-                        .fill(.quaternary.opacity(0.15))
+                    RoundedRectangle(cornerRadius: 24)
+                        .fill(.quaternary.opacity(0.1))
 
                     if let image = tab.snapshotSwiftUIImage {
                         image
                             .resizable()
                             .aspectRatio(contentMode: .fill)
                     } else {
-                        VStack(spacing: 6) {
+                        VStack(spacing: 8) {
                             Image(systemName: tab.isPrivate ? "eye.slash.fill" : (tab.currentURL != nil ? "doc.richtext" : "globe"))
-                                .font(.system(size: 30, weight: .ultraLight))
-                                .foregroundStyle(tab.isPrivate ? Color.purple.opacity(0.5) : Color.secondary.opacity(0.5))
+                                .font(.system(size: 32, weight: .ultraLight))
+                                .foregroundStyle(tab.isPrivate ? Color.purple.opacity(0.5) : Color.secondary.opacity(0.4))
                             if tab.currentURL == nil {
                                 Text(tab.isPrivate ? "New Private Tab" : "New Tab")
-                                    .font(.system(size: 11, weight: .medium))
-                                    .foregroundStyle(tab.isPrivate ? Color.purple.opacity(0.4) : Color.secondary.opacity(0.4))
+                                    .font(.system(size: 12, weight: .medium, design: .rounded))
+                                    .foregroundStyle(tab.isPrivate ? Color.purple.opacity(0.4) : Color.secondary.opacity(0.35))
                             }
                         }
                     }
                 }
-                .frame(height: 250)
-                .clipped()
+                .frame(height: 240)
+                .clipShape(RoundedRectangle(cornerRadius: 24))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 24)
+                        .strokeBorder(
+                            isSelected ? Color.accentColor : Color.clear,
+                            lineWidth: isSelected ? 2.5 : 0
+                        )
+                )
                 .overlay(alignment: .topTrailing) {
                     Button {
                         withAnimation(.spring(duration: 0.3, bounce: 0.15)) {
@@ -2119,48 +2336,35 @@ struct ContentView: View {
                         }
                     } label: {
                         Image(systemName: "xmark")
-                            .font(.system(size: 9, weight: .bold))
+                            .font(.system(size: 12, weight: .bold))
                             .foregroundStyle(.secondary)
-                            .frame(width: 24, height: 24)
+                            .frame(width: 32, height: 32)
                             .glassEffect(.regular, in: .circle)
                     }
                     .buttonStyle(.plain)
-                    .padding(6)
+                    .padding(8)
                 }
 
-                HStack(spacing: 6) {
+                HStack(spacing: 5) {
                     if tab.currentURL != nil {
-                        favicon(for: tab, size: 14)
+                        favicon(for: tab, size: 13)
                     } else {
                         Image(systemName: "globe")
                             .font(.system(size: 10))
                             .foregroundStyle(.secondary)
-                            .frame(width: 14, height: 14)
+                            .frame(width: 13, height: 13)
                     }
 
                     Text(tab.title)
-                        .font(.system(size: 11, weight: .medium))
+                        .font(.system(size: 12, weight: .medium, design: .rounded))
                         .lineLimit(1)
                         .foregroundStyle(.primary)
-
-                    Spacer(minLength: 0)
                 }
-                .padding(.horizontal, 10)
-                .padding(.vertical, 8)
-                .glassEffect(.regular, in: UnevenRoundedRectangle(
-                    topLeadingRadius: 0, bottomLeadingRadius: 14,
-                    bottomTrailingRadius: 14, topTrailingRadius: 0
-                ))
+                .padding(.horizontal, 14)
+                .padding(.vertical, 7)
+                .glassEffect(.regular, in: .capsule)
             }
-            .clipShape(RoundedRectangle(cornerRadius: 14))
-            .overlay(
-                RoundedRectangle(cornerRadius: 14)
-                    .strokeBorder(
-                        isSelected ? Color.accentColor : Color.clear,
-                        lineWidth: isSelected ? 2.5 : 0
-                    )
-            )
-            .shadow(color: .black.opacity(0.06), radius: 10, y: 5)
+            .shadow(color: .black.opacity(0.08), radius: 12, y: 6)
         }
         .buttonStyle(PressableButtonStyle())
         .contextMenu {
@@ -2775,6 +2979,9 @@ struct ContentView: View {
     }
 
     private var startPageGradientColors: (Color, Color) {
+        if showStartPageOverlay && addressBarOnTop {
+            return (.primary, .primary.opacity(0.8))
+        }
         switch viewModel.startPageSettings.gradientPreset {
         case .monochrome:
             return (.gray, .black)
