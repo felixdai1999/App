@@ -208,6 +208,20 @@ class BrowserViewModel {
         }
     }
 
+    func closeOtherTabs(_ keepID: UUID) {
+        let isNormal = activeGroup == .normal
+        for tab in tabs where tab.id != keepID {
+            if let url = tab.currentURL, isNormal {
+                closedTabs.append((title: tab.title, url: url))
+            }
+        }
+        tabs.removeAll { $0.id != keepID }
+        selectedTabID = keepID
+        if isNormal {
+            saveTabs()
+        }
+    }
+
     func reopenLastClosedTab() {
         guard let last = closedTabs.popLast() else { return }
         if activeGroup == .privateMode { switchGroup(.normal) }

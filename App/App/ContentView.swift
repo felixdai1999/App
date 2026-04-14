@@ -52,8 +52,19 @@ struct ContentView: View {
     @State private var showCustomizeStartPage = false
     @State private var showStartPageOverlay = false
     @State private var bottomContainerWidth: CGFloat = 300
+    @State private var showClearHistoryConfirmation = false
+    @State private var showCloseAllTabsConfirmation = false
+    @State private var googleAutocompleteQueries: [String] = []
+    @State private var googleSuggestTask: Task<Void, Never>?
+    @State private var focusedAddressSeedText = ""
+    @State private var hasEditedAddressTextSinceFocus = false
+    @State private var recentSearchQueries: [String] = []
+    @AppStorage("hasSeenOnboarding") private var hasSeenOnboarding = false
+    @State private var showOnboarding = false
+    @State private var onboardingStep = 0
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @Environment(\.verticalSizeClass) private var verticalSizeClass
+    private let recentSearchesDefaultsKey = "recent_search_queries"
 
     private var shouldShowTabStrip: Bool {
         guard viewModel.tabs.count > 1 else { return false }
@@ -87,6 +98,12 @@ struct ContentView: View {
                 tabOverview
                     .transition(.opacity)
             }
+
+            if shouldShowAutocompleteOverlay {
+                autocompleteFloatingLayer
+                    .transition(.move(edge: .top).combined(with: .opacity))
+                    .zIndex(200)
+            }
         }
         .animation(.spring(duration: 0.45, bounce: 0.12), value: showTabOverview)
         .onChange(of: viewModel.selectedTabID) {
@@ -104,17 +121,46 @@ struct ContentView: View {
                 UIImpactFeedbackGenerator(style: .light).impactOccurred()
                 #endif
                 addressText = viewModel.selectedTab?.currentURL?.absoluteString ?? ""
+                focusedAddressSeedText = addressText
+                hasEditedAddressTextSinceFocus = false
                 if viewModel.selectedTab?.currentURL != nil {
                     withAnimation(.spring(duration: 0.4, bounce: 0.08)) {
                         showStartPageOverlay = true
                     }
                 }
             } else {
+                googleSuggestTask?.cancel()
+                googleAutocompleteQueries = []
+                hasEditedAddressTextSinceFocus = false
                 withAnimation(.spring(duration: 0.3, bounce: 0.05)) {
                     showStartPageOverlay = false
                 }
                 syncAddressText()
             }
+        }
+        .onChange(of: addressText) { _, text in
+            if isAddressBarFocused && !hasEditedAddressTextSinceFocus && text != focusedAddressSeedText {
+                hasEditedAddressTextSinceFocus = true
+            }
+            fetchGoogleAutocompleteSuggestions(for: text)
+        }
+        .onAppear {
+            loadRecentSearches()
+            if !hasSeenOnboarding {
+                showOnboarding = true
+            }
+            #if os(iOS)
+            if let pendingAction = AppDelegate.pendingQuickAction {
+                handleHomeScreenQuickAction(pendingAction)
+                AppDelegate.pendingQuickAction = nil
+            }
+            #endif
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .homeScreenQuickActionTriggered)) { notification in
+            #if os(iOS)
+            guard let action = notification.object as? HomeScreenQuickAction else { return }
+            handleHomeScreenQuickAction(action)
+            #endif
         }
         .overlay { keyboardShortcuts }
         .sensoryFeedback(.selection, trigger: viewModel.selectedTabID)
@@ -131,6 +177,9 @@ struct ContentView: View {
         }
         .sheet(isPresented: $showSettings) {
             settingsSheet
+        }
+        .fullScreenCover(isPresented: $showOnboarding) {
+            onboardingScreen
         }
         .preferredColorScheme(viewModel.theme.colorScheme)
     }
@@ -505,6 +554,16 @@ struct ContentView: View {
             }
             
             Divider()
+
+            if viewModel.tabs.count > 1 {
+                Button {
+                    withAnimation(.snappy(duration: 0.25)) {
+                        viewModel.closeOtherTabs(tab.id)
+                    }
+                } label: {
+                    Label("Close Other Tabs", systemImage: "xmark.square")
+                }
+            }
             
             Button(role: .destructive) {
                 withAnimation(.snappy(duration: 0.25)) {
@@ -736,8 +795,7 @@ struct ContentView: View {
                         .multilineTextAlignment(isAddressBarFocused ? .leading : .center)
                         .focused($isAddressBarFocused)
                         .onSubmit {
-                            viewModel.selectedTab?.loadRequest(addressText, engine: viewModel.searchEngine)
-                            isAddressBarFocused = false
+                            submitAddressBarText(addressText)
                         }
                         #if os(iOS)
                         .textInputAutocapitalization(.never)
@@ -1126,6 +1184,22 @@ struct ContentView: View {
                 )
             }
 
+            let isFavorited = viewModel.favoriteStore.favorites.contains { $0.url == url }
+            Button {
+                if isFavorited {
+                    if let fav = viewModel.favoriteStore.favorites.first(where: { $0.url == url }) {
+                        viewModel.favoriteStore.removeFavorite(id: fav.id)
+                    }
+                } else {
+                    viewModel.favoriteStore.addFavorite(title: tab.title, url: url)
+                }
+            } label: {
+                Label(
+                    isFavorited ? "Remove Favorite" : "Add Favorite",
+                    systemImage: isFavorited ? "heart.fill" : "heart"
+                )
+            }
+
             Divider()
         }
 
@@ -1144,7 +1218,7 @@ struct ContentView: View {
         }
 
         Button { showSettings = true } label: {
-            Label("Settings", systemImage: "gearshape")
+            Label("Settings", systemImage: "gear")
         }
 
         if viewModel.selectedTab?.currentURL != nil {
@@ -1399,6 +1473,431 @@ struct ContentView: View {
         }
         .ignoresSafeArea(.keyboard)
         .zIndex(100)
+    }
+
+    // MARK: - Autocomplete Suggestions
+
+    private enum AutocompleteSection: String {
+        case recent = "Recent Searches"
+        case google = "Google Suggestions"
+        case local = "Bookmarks, History and Tabs"
+    }
+
+    private enum AutocompleteSuggestionKind {
+        case localURL(URL)
+        case googleQuery(String)
+    }
+
+    private struct AutocompleteSuggestion: Identifiable {
+        let id = UUID()
+        let title: String
+        let subtitle: String
+        let icon: String
+        let iconColor: Color
+        let kind: AutocompleteSuggestionKind
+        let section: AutocompleteSection
+    }
+
+    private var localAutocompleteSuggestions: [AutocompleteSuggestion] {
+        let query = addressText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !query.isEmpty, isAddressBarFocused else { return [] }
+
+        var results: [AutocompleteSuggestion] = []
+        var seenURLs = Set<String>()
+
+        // Prioritize currently open tabs so they are always visible in suggestions.
+        for tab in viewModel.tabs {
+            guard let url = tab.currentURL else { continue }
+            let key = url.absoluteString.lowercased()
+            if tab.title.localizedCaseInsensitiveContains(query) || key.localizedCaseInsensitiveContains(query) {
+                seenURLs.insert(key)
+                results.append(.init(
+                    title: tab.title,
+                    subtitle: "Open tab • \(url.host ?? url.absoluteString)",
+                    icon: "square.on.square",
+                    iconColor: .purple,
+                    kind: .localURL(url),
+                    section: .local
+                ))
+            }
+            if results.count >= 6 { break }
+        }
+
+        for bookmark in viewModel.bookmarkStore.bookmarks {
+            let key = bookmark.url.absoluteString.lowercased()
+            guard !seenURLs.contains(key) else { continue }
+            if bookmark.title.localizedCaseInsensitiveContains(query) ||
+               bookmark.url.absoluteString.localizedCaseInsensitiveContains(query) {
+                seenURLs.insert(key)
+                results.append(.init(
+                    title: bookmark.title,
+                    subtitle: bookmark.url.host ?? bookmark.url.absoluteString,
+                    icon: "bookmark.fill",
+                    iconColor: .orange,
+                    kind: .localURL(bookmark.url),
+                    section: .local
+                ))
+            }
+            if results.count >= 12 { break }
+        }
+
+        for favorite in viewModel.favoriteStore.favorites {
+            let key = favorite.url.absoluteString.lowercased()
+            guard !seenURLs.contains(key) else { continue }
+            if favorite.title.localizedCaseInsensitiveContains(query) ||
+               favorite.url.absoluteString.localizedCaseInsensitiveContains(query) {
+                seenURLs.insert(key)
+                results.append(.init(
+                    title: favorite.title,
+                    subtitle: favorite.url.host ?? favorite.url.absoluteString,
+                    icon: "bookmark.fill",
+                    iconColor: .orange,
+                    kind: .localURL(favorite.url),
+                    section: .local
+                ))
+            }
+            if results.count >= 12 { break }
+        }
+
+        for entry in viewModel.historyStore.entries {
+            let key = entry.url.absoluteString.lowercased()
+            guard !seenURLs.contains(key) else { continue }
+            if entry.title.localizedCaseInsensitiveContains(query) ||
+               entry.url.absoluteString.localizedCaseInsensitiveContains(query) {
+                seenURLs.insert(key)
+                results.append(.init(
+                    title: entry.title,
+                    subtitle: entry.url.host ?? entry.url.absoluteString,
+                    icon: "clock.fill",
+                    iconColor: .blue,
+                    kind: .localURL(entry.url),
+                    section: .local
+                ))
+            }
+            if results.count >= 12 { break }
+        }
+
+        return Array(results.prefix(12))
+    }
+
+    private var recentSearchSuggestions: [AutocompleteSuggestion] {
+        recentSearchQueries.prefix(10).map { query in
+            .init(
+                title: query,
+                subtitle: "Recent search",
+                icon: "magnifyingglass",
+                iconColor: .secondary,
+                kind: .googleQuery(query),
+                section: .recent
+            )
+        }
+    }
+
+    private var googleSuggestionItems: [AutocompleteSuggestion] {
+        let query = addressText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return [] }
+
+        var items: [AutocompleteSuggestion] = []
+        var seenTitles = Set<String>()
+
+        for suggestion in googleAutocompleteQueries {
+            let normalized = suggestion.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !normalized.isEmpty else { continue }
+            let key = normalized.lowercased()
+            guard !seenTitles.contains(key) else { continue }
+            seenTitles.insert(key)
+            items.append(.init(
+                title: normalized,
+                subtitle: "Google suggestion",
+                icon: "magnifyingglass",
+                iconColor: .blue,
+                kind: .googleQuery(normalized),
+                section: .google
+            ))
+        }
+
+        if items.isEmpty, !query.isEmpty {
+            items.append(.init(
+                title: query,
+                subtitle: "Search with Google",
+                icon: "magnifyingglass",
+                iconColor: .blue,
+                kind: .googleQuery(query),
+                section: .google
+            ))
+        }
+
+        return Array(items.prefix(6))
+    }
+
+    private var autocompleteSuggestions: [AutocompleteSuggestion] {
+        let query = addressText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if query.isEmpty {
+            return recentSearchSuggestions
+        }
+        return googleSuggestionItems + localAutocompleteSuggestions
+    }
+
+    private var shouldShowAutocompleteOverlay: Bool {
+        guard isAddressBarFocused, !showTabOverview else { return false }
+        let query = addressText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if query.isEmpty {
+            return !recentSearchSuggestions.isEmpty
+        }
+        return hasEditedAddressTextSinceFocus && !autocompleteSuggestions.isEmpty
+    }
+
+    /// Portrait + bottom address bar: use a small top gap instead of full safe-area inset so more room for results.
+    private func autocompletePortraitTopGap(_ safeTop: CGFloat) -> CGFloat {
+        #if os(iOS)
+        min(max(safeTop * 0.28, 6), 16)
+        #else
+        safeTop
+        #endif
+    }
+
+    /// Bottom chrome height so autocomplete stays above the address bar in portrait (not only above the keyboard).
+    private var autocompleteBottomChromeInset: CGFloat {
+        #if os(iOS)
+        if addressBarOnTop {
+            return 0
+        }
+        let expanded = isToolbarExpanded || isAddressBarFocused
+        let h = viewModel.bottomBarHeight
+        if expanded, h > 0.5 { return h }
+        return max(h, isAddressBarFocused ? 76 : 56)
+        #else
+        return 0
+        #endif
+    }
+
+    private var autocompleteFloatingLayer: some View {
+        GeometryReader { proxy in
+            VStack(spacing: 0) {
+                Color.clear
+                    .frame(height: addressBarOnTop ? (viewModel.topBarHeight + 6) : autocompletePortraitTopGap(proxy.safeAreaInsets.top))
+
+                autocompleteSuggestionsList
+                    .padding(.horizontal, 14)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+            }
+            .padding(.bottom, autocompleteBottomChromeInset)
+            .frame(width: proxy.size.width, height: proxy.size.height, alignment: .top)
+        }
+        .allowsHitTesting(true)
+    }
+
+    private var autocompleteSuggestionsList: some View {
+        let query = addressText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let grouped = Dictionary(grouping: autocompleteSuggestions, by: \.section)
+        let order: [AutocompleteSection] = query.isEmpty ? [.recent] : [.google, .local]
+
+        return List {
+            ForEach(order, id: \.rawValue) { section in
+                if let items = grouped[section], !items.isEmpty {
+                    HStack {
+                        Text(section.rawValue)
+                            .font(.system(size: 11, weight: .bold, design: .rounded))
+                            .foregroundStyle(.tertiary)
+
+                        Spacer(minLength: 0)
+
+                        if section == .recent {
+                            Button("Clear") {
+                                withAnimation {
+                                    recentSearchQueries = []
+                                    saveRecentSearches()
+                                }
+                            }
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                            .buttonStyle(.plain)
+                        }
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.bottom, 2)
+                    .padding(.top, section == order.first ? 0 : 8)
+                    .listRowSeparator(.hidden)
+                    .listRowBackground(Color.clear)
+                    .listRowInsets(EdgeInsets())
+
+                    ForEach(items) { suggestion in
+                        autocompleteRow(suggestion)
+                            .listRowSeparator(.hidden)
+                            .listRowBackground(Color.clear)
+                            .listRowInsets(EdgeInsets(top: 2, leading: 0, bottom: 2, trailing: 0))
+                    }
+                }
+            }
+        }
+        .listStyle(.plain)
+        .scrollContentBackground(.hidden)
+        .scrollIndicators(.hidden)
+        .frame(maxHeight: .infinity, alignment: .top)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 8)
+        .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .strokeBorder(Color.white.opacity(0.14), lineWidth: 0.5)
+        }
+        .shadow(color: .black.opacity(0.12), radius: 24, x: 0, y: 8)
+        .animation(.spring(duration: 0.35, bounce: 0.14), value: autocompleteSuggestions.map(\.title))
+    }
+
+    @ViewBuilder
+    private func autocompleteRow(_ suggestion: AutocompleteSuggestion) -> some View {
+        let row = Button {
+            #if os(iOS)
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            #endif
+            switch suggestion.kind {
+            case .localURL(let url):
+                viewModel.selectedTab?.load(url)
+            case .googleQuery(let query):
+                recordRecentSearch(query)
+                if let googleURL = SearchEngine.google.searchURL(query: query) {
+                    viewModel.selectedTab?.load(googleURL)
+                }
+            }
+            isAddressBarFocused = false
+        } label: {
+            HStack(spacing: 12) {
+                Image(systemName: suggestion.icon)
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(suggestion.iconColor)
+                    .frame(width: 28, height: 28)
+                    .background(suggestion.iconColor.opacity(0.12), in: RoundedRectangle(cornerRadius: 7))
+
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(suggestion.title)
+                        .font(.system(size: 14, weight: .medium))
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+
+                    Text(suggestion.subtitle)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+
+                Spacer(minLength: 0)
+
+                Image(systemName: "arrow.up.left")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.tertiary)
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 8)
+            .background(
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .fill(Color.white.opacity(0.05))
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+
+        if suggestion.section == .recent {
+            row
+                .contextMenu {
+                    Button(role: .destructive) {
+                        deleteRecentSearch(suggestion.title)
+                    } label: {
+                        Label("Delete", systemImage: "trash")
+                    }
+                }
+                .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                    Button(role: .destructive) {
+                        withAnimation {
+                            deleteRecentSearch(suggestion.title)
+                        }
+                    } label: {
+                        Label("Delete", systemImage: "trash")
+                    }
+                }
+        } else {
+            row
+        }
+    }
+
+    private func deleteRecentSearch(_ query: String) {
+        recentSearchQueries.removeAll { $0 == query }
+        saveRecentSearches()
+    }
+
+    private func fetchGoogleAutocompleteSuggestions(for text: String) {
+        let query = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard isAddressBarFocused, hasEditedAddressTextSinceFocus, !query.isEmpty else {
+            googleSuggestTask?.cancel()
+            googleAutocompleteQueries = []
+            return
+        }
+
+        googleSuggestTask?.cancel()
+        googleSuggestTask = Task {
+            try? await Task.sleep(for: .milliseconds(220))
+            guard !Task.isCancelled else { return }
+            let suggestions = await requestGoogleSuggestions(query: query)
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                if addressText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == query.lowercased() {
+                    googleAutocompleteQueries = suggestions
+                }
+            }
+        }
+    }
+
+    private func requestGoogleSuggestions(query: String) async -> [String] {
+        let encoded = query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? query
+        guard let url = URL(string: "https://suggestqueries.google.com/complete/search?client=firefox&q=\(encoded)") else {
+            return []
+        }
+
+        do {
+            let (data, _) = try await URLSession.shared.data(from: url)
+            guard let json = try JSONSerialization.jsonObject(with: data) as? [Any],
+                  json.count > 1,
+                  let list = json[1] as? [String] else {
+                return []
+            }
+            return Array(list.prefix(6))
+        } catch {
+            return []
+        }
+    }
+
+    private func submitAddressBarText(_ input: String) {
+        let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        if isLikelySearchQuery(trimmed) {
+            recordRecentSearch(trimmed)
+        }
+        viewModel.selectedTab?.loadRequest(trimmed, engine: viewModel.searchEngine)
+        isAddressBarFocused = false
+    }
+
+    private func isLikelySearchQuery(_ text: String) -> Bool {
+        if text.hasPrefix("http://") || text.hasPrefix("https://") { return false }
+        if text.contains(" ") { return true }
+        if !text.contains(".") { return true }
+        return false
+    }
+
+    private func recordRecentSearch(_ query: String) {
+        let normalized = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else { return }
+        recentSearchQueries.removeAll { $0.caseInsensitiveCompare(normalized) == .orderedSame }
+        recentSearchQueries.insert(normalized, at: 0)
+        recentSearchQueries = Array(recentSearchQueries.prefix(20))
+        saveRecentSearches()
+    }
+
+    private func loadRecentSearches() {
+        recentSearchQueries = UserDefaults.standard.stringArray(forKey: recentSearchesDefaultsKey) ?? []
+    }
+
+    private func saveRecentSearches() {
+        UserDefaults.standard.set(recentSearchQueries, forKey: recentSearchesDefaultsKey)
     }
 
     // MARK: - Start Page
@@ -2153,46 +2652,59 @@ struct ContentView: View {
 
     private var tabOverview: some View {
         ZStack(alignment: .bottom) {
-            ScrollView {
-                let columns = [
-                    GridItem(.flexible(), spacing: 14),
-                    GridItem(.flexible(), spacing: 14)
-                ]
+            ScrollViewReader { proxy in
+                ScrollView {
+                    let minWidth: CGFloat = {
+                        #if os(iOS)
+                        if horizontalSizeClass == .regular { return 200 }
+                        if verticalSizeClass == .compact { return 180 }
+                        #endif
+                        return 160
+                    }()
+                    let columns = [GridItem(.adaptive(minimum: minWidth, maximum: 320), spacing: 20)]
 
-                LazyVGrid(columns: columns, spacing: 16) {
-                    ForEach(viewModel.tabs) { tab in
-                        tabCard(for: tab)
-                            .transition(.scale(scale: 0.8).combined(with: .opacity))
-                            .draggable(tab.id.uuidString) {
-                                RoundedRectangle(cornerRadius: 22)
-                                    .fill(.quaternary)
-                                    .frame(width: 120, height: 160)
-                                    .overlay(
-                                        Text(tab.title)
-                                            .font(.system(size: 10))
-                                            .lineLimit(1)
-                                            .foregroundStyle(.secondary)
-                                    )
-                            }
-                            .dropDestination(for: String.self) { items, _ in
-                                guard let draggedIDString = items.first,
-                                      let draggedID = UUID(uuidString: draggedIDString),
-                                      let fromIndex = viewModel.tabs.firstIndex(where: { $0.id == draggedID }),
-                                      let toIndex = viewModel.tabs.firstIndex(where: { $0.id == tab.id }),
-                                      fromIndex != toIndex else { return false }
-                                withAnimation(.spring(duration: 0.3, bounce: 0.15)) {
-                                    viewModel.tabs.move(
-                                        fromOffsets: IndexSet(integer: fromIndex),
-                                        toOffset: toIndex > fromIndex ? toIndex + 1 : toIndex
-                                    )
+                    LazyVGrid(columns: columns, spacing: 20) {
+                        ForEach(viewModel.tabs) { tab in
+                            tabCard(for: tab)
+                                .id(tab.id)
+                                .transition(.scale(scale: 0.8).combined(with: .opacity))
+                                .contentShape(Rectangle())
+                                .draggable(tab.id.uuidString) {
+                                    RoundedRectangle(cornerRadius: 22)
+                                        .fill(.quaternary)
+                                        .frame(width: 120, height: 160)
+                                        .overlay(
+                                            Text(tab.title)
+                                                .font(.system(size: 10))
+                                                .lineLimit(1)
+                                                .foregroundStyle(.secondary)
+                                        )
                                 }
-                                return true
-                            }
+                                .dropDestination(for: String.self) { items, _ in
+                                    guard let draggedIDString = items.first,
+                                          let draggedID = UUID(uuidString: draggedIDString),
+                                          let fromIndex = viewModel.tabs.firstIndex(where: { $0.id == draggedID }),
+                                          let toIndex = viewModel.tabs.firstIndex(where: { $0.id == tab.id }),
+                                          fromIndex != toIndex else { return false }
+                                    withAnimation(.spring(duration: 0.3, bounce: 0.15)) {
+                                        viewModel.tabs.move(
+                                            fromOffsets: IndexSet(integer: fromIndex),
+                                            toOffset: toIndex > fromIndex ? toIndex + 1 : toIndex
+                                        )
+                                    }
+                                    return true
+                                }
+                        }
+                    }
+                    .padding(.horizontal, 24)
+                    .padding(.top, 24)
+                    .padding(.bottom, 110)
+                }
+                .onAppear {
+                    if let selectedID = viewModel.selectedTabID {
+                        proxy.scrollTo(selectedID, anchor: .center)
                     }
                 }
-                .padding(.horizontal, 14)
-                .padding(.top, 14)
-                .padding(.bottom, 80)
             }
 
             overviewBottomBar
@@ -2295,7 +2807,7 @@ struct ContentView: View {
                 showTabOverview = false
             }
         } label: {
-            VStack(spacing: 10) {
+            VStack(spacing: verticalSizeClass == .compact ? 6 : 10) {
                 ZStack {
                     RoundedRectangle(cornerRadius: 24)
                         .fill(.quaternary.opacity(0.1))
@@ -2317,7 +2829,7 @@ struct ContentView: View {
                         }
                     }
                 }
-                .frame(height: 240)
+                .frame(height: verticalSizeClass == .compact ? 140 : 240)
                 .clipShape(RoundedRectangle(cornerRadius: 24))
                 .overlay(
                     RoundedRectangle(cornerRadius: 24)
@@ -2336,13 +2848,15 @@ struct ContentView: View {
                         }
                     } label: {
                         Image(systemName: "xmark")
-                            .font(.system(size: 12, weight: .bold))
+                            .font(.system(size: 11, weight: .bold))
                             .foregroundStyle(.secondary)
-                            .frame(width: 32, height: 32)
+                            .frame(width: 30, height: 30)
                             .glassEffect(.regular, in: .circle)
+                            .padding(4)
+                            .contentShape(Circle())
                     }
                     .buttonStyle(.plain)
-                    .padding(8)
+                    .padding(4)
                 }
 
                 HStack(spacing: 5) {
@@ -2364,21 +2878,12 @@ struct ContentView: View {
                 .padding(.vertical, 7)
                 .glassEffect(.regular, in: .capsule)
             }
+            .padding(2)
             .shadow(color: .black.opacity(0.08), radius: 12, y: 6)
+            .contentShape(Rectangle())
         }
         .buttonStyle(PressableButtonStyle())
         .contextMenu {
-            Button(role: .destructive) {
-                withAnimation(.spring(duration: 0.3, bounce: 0.15)) {
-                    viewModel.closeTab(tab.id)
-                    if viewModel.tabs.isEmpty {
-                        showTabOverview = false
-                    }
-                }
-            } label: {
-                Label("Close Tab", systemImage: "trash")
-            }
-
             if let url = tab.currentURL {
                 Button {
                     #if os(iOS)
@@ -2394,6 +2899,29 @@ struct ContentView: View {
                 ShareLink(item: url) {
                     Label("Share", systemImage: "square.and.arrow.up")
                 }
+
+                Divider()
+            }
+
+            if viewModel.tabs.count > 1 {
+                Button {
+                    withAnimation(.spring(duration: 0.3, bounce: 0.15)) {
+                        viewModel.closeOtherTabs(tab.id)
+                    }
+                } label: {
+                    Label("Close Other Tabs", systemImage: "xmark.square")
+                }
+            }
+
+            Button(role: .destructive) {
+                withAnimation(.spring(duration: 0.3, bounce: 0.15)) {
+                    viewModel.closeTab(tab.id)
+                    if viewModel.tabs.isEmpty {
+                        showTabOverview = false
+                    }
+                }
+            } label: {
+                Label("Close Tab", systemImage: "trash")
             }
         }
     }
@@ -2557,6 +3085,32 @@ struct ContentView: View {
                                 .contentShape(Rectangle())
                             }
                             .buttonStyle(.plain)
+                            .contextMenu {
+                                Button {
+                                    viewModel.addNewTab(url: entry.url)
+                                    showBookmarks = false
+                                } label: {
+                                    Label("Open in New Tab", systemImage: "plus.square.on.square")
+                                }
+
+                                Button {
+                                    copyURLToClipboard(entry.url)
+                                } label: {
+                                    Label("Copy Link", systemImage: "doc.on.doc")
+                                }
+
+                                ShareLink(item: entry.url) {
+                                    Label("Share", systemImage: "square.and.arrow.up")
+                                }
+
+                                Divider()
+
+                                Button(role: .destructive) {
+                                    viewModel.historyStore.removeEntry(entry.id)
+                                } label: {
+                                    Label("Delete", systemImage: "trash")
+                                }
+                            }
                             .swipeActions(edge: .trailing) {
                                 Button("Delete", role: .destructive) {
                                     viewModel.historyStore.removeEntry(entry.id)
@@ -2690,6 +3244,32 @@ struct ContentView: View {
                             .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
+                        .contextMenu {
+                            Button {
+                                viewModel.addNewTab(url: bookmark.url)
+                                showBookmarks = false
+                            } label: {
+                                Label("Open in New Tab", systemImage: "plus.square.on.square")
+                            }
+
+                            Button {
+                                copyURLToClipboard(bookmark.url)
+                            } label: {
+                                Label("Copy Link", systemImage: "doc.on.doc")
+                            }
+
+                            ShareLink(item: bookmark.url) {
+                                Label("Share", systemImage: "square.and.arrow.up")
+                            }
+
+                            Divider()
+
+                            Button(role: .destructive) {
+                                viewModel.bookmarkStore.removeBookmark(id: bookmark.id)
+                            } label: {
+                                Label("Delete Bookmark", systemImage: "trash")
+                            }
+                        }
                     }
                     .onDelete { indexSet in
                         for index in indexSet {
@@ -2734,27 +3314,60 @@ struct ContentView: View {
                         .italic()
                 } else {
                     ForEach(filteredFavorites) { favorite in
-                        HStack(spacing: 12) {
-                            let letter = String(favorite.title.prefix(1)).uppercased()
-                            ZStack {
-                                RoundedRectangle(cornerRadius: 9)
-                                    .fill(Color.accentColor.opacity(0.12))
-                                    .frame(width: 30, height: 30)
-                                Text(letter)
-                                    .font(.system(size: 13, weight: .heavy, design: .rounded))
-                                    .foregroundStyle(Color.accentColor)
+                        Button {
+                            viewModel.selectedTab?.load(favorite.url)
+                            showBookmarks = false
+                        } label: {
+                            HStack(spacing: 12) {
+                                let letter = String(favorite.title.prefix(1)).uppercased()
+                                ZStack {
+                                    RoundedRectangle(cornerRadius: 9)
+                                        .fill(Color.accentColor.opacity(0.12))
+                                        .frame(width: 30, height: 30)
+                                    Text(letter)
+                                        .font(.system(size: 13, weight: .heavy, design: .rounded))
+                                        .foregroundStyle(Color.accentColor)
+                                }
+
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(favorite.title)
+                                        .font(.system(size: 15, weight: .medium))
+                                        .foregroundStyle(.primary)
+                                        .lineLimit(1)
+
+                                    Text(favorite.url.host ?? favorite.url.absoluteString)
+                                        .font(.system(size: 12))
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(1)
+                                }
+                            }
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .contextMenu {
+                            Button {
+                                viewModel.addNewTab(url: favorite.url)
+                                showBookmarks = false
+                            } label: {
+                                Label("Open in New Tab", systemImage: "plus.square.on.square")
                             }
 
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(favorite.title)
-                                    .font(.system(size: 15, weight: .medium))
-                                    .foregroundStyle(.primary)
-                                    .lineLimit(1)
+                            Button {
+                                copyURLToClipboard(favorite.url)
+                            } label: {
+                                Label("Copy Link", systemImage: "doc.on.doc")
+                            }
 
-                                Text(favorite.url.host ?? favorite.url.absoluteString)
-                                    .font(.system(size: 12))
-                                    .foregroundStyle(.secondary)
-                                    .lineLimit(1)
+                            ShareLink(item: favorite.url) {
+                                Label("Share", systemImage: "square.and.arrow.up")
+                            }
+
+                            Divider()
+
+                            Button(role: .destructive) {
+                                viewModel.favoriteStore.removeFavorite(id: favorite.id)
+                            } label: {
+                                Label("Remove Favorite", systemImage: "trash")
                             }
                         }
                     }
@@ -2832,11 +3445,26 @@ struct ContentView: View {
                         )
                     }
                     .buttonStyle(.plain)
+
+                    Button {
+                        showSettings = false
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                            showOnboarding = true
+                        }
+                    } label: {
+                        settingsRow(
+                            title: "View Onboarding",
+                            systemImage: "wand.and.stars",
+                            color: .orange
+                        )
+                    }
+                    .buttonStyle(.plain)
                 }
+
 
                 Section("Data") {
                     Button(role: .destructive) {
-                        viewModel.historyStore.clearHistory()
+                        showClearHistoryConfirmation = true
                     } label: {
                         settingsRow(
                             title: "Clear History",
@@ -2847,9 +3475,17 @@ struct ContentView: View {
                     }
                     .buttonStyle(.plain)
                     .disabled(viewModel.historyStore.entries.isEmpty)
+                    .alert("Clear All History?", isPresented: $showClearHistoryConfirmation) {
+                        Button("Clear", role: .destructive) {
+                            viewModel.historyStore.clearHistory()
+                        }
+                        Button("Cancel", role: .cancel) {}
+                    } message: {
+                        Text("This will permanently remove all \(viewModel.historyStore.entries.count) history entries. This action cannot be undone.")
+                    }
 
                     Button(role: .destructive) {
-                        viewModel.closeAllTabs()
+                        showCloseAllTabsConfirmation = true
                     } label: {
                         settingsRow(
                             title: "Close All Tabs",
@@ -2860,6 +3496,14 @@ struct ContentView: View {
                     }
                     .buttonStyle(.plain)
                     .disabled(viewModel.tabs.count <= 1 && viewModel.selectedTab?.currentURL == nil)
+                    .alert("Close All Tabs?", isPresented: $showCloseAllTabsConfirmation) {
+                        Button("Close All", role: .destructive) {
+                            viewModel.closeAllTabs()
+                        }
+                        Button("Cancel", role: .cancel) {}
+                    } message: {
+                        Text("This will close all \(viewModel.tabs.count) open tabs.")
+                    }
                 }
 
                 Section {
@@ -2886,6 +3530,325 @@ struct ContentView: View {
         #if os(iOS)
         .presentationDetents([.medium])
         #endif
+    }
+
+    // MARK: - Onboarding Screen
+
+    private var onboardingScreen: some View {
+        ZStack {
+            let (c1, c2) = startPageGradientColors
+            
+            // Full background without conditional clear checks for consistency
+            ZStack {
+                LinearGradient(
+                    colors: startPageAmbientBaseGradient,
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+                .opacity(0.35)
+                
+                RadialGradient(
+                    colors: [c1.opacity(0.38), c1.opacity(0.15), .clear],
+                    center: .topLeading,
+                    startRadius: 40,
+                    endRadius: 560
+                )
+                
+                RadialGradient(
+                    colors: [c2.opacity(0.34), c2.opacity(0.14), .clear],
+                    center: .bottomTrailing,
+                    startRadius: 30,
+                    endRadius: 520
+                )
+            }
+            .ignoresSafeArea()
+            .background(
+                Rectangle() // Extra fallback
+                    .fill(.background)
+                    .ignoresSafeArea()
+            )
+
+            TabView(selection: $onboardingStep) {
+                onboardingWelcomePage
+                    .tag(0)
+                
+                onboardingHeroPage(
+                    icon: "bolt.circle.fill",
+                    gradient: [.orange, .yellow],
+                    title: "Lightning Fast",
+                    subtitle: "Open pages quickly with a lightweight browsing engine tuned for responsiveness.",
+                    highlights: [("speedometer", "Fast Load"), ("waveform.path.ecg", "Smooth")]
+                )
+                .tag(1)
+                
+                onboardingHeroPage(
+                    icon: "slider.horizontal.3",
+                    gradient: [.purple, .pink],
+                    title: "Built Around You",
+                    subtitle: "Customize your start page, theme, and shortcuts to match the way you browse.",
+                    highlights: [("paintbrush.pointed.fill", "Themes"), ("square.grid.2x2.fill", "Shortcuts")]
+                )
+                .tag(2)
+                
+                onboardingHeroPage(
+                    icon: "square.stack.3d.up.fill",
+                    gradient: [.blue, .cyan],
+                    title: "Intelligent Tabs",
+                    subtitle: "Keep everything organized with smarter tab management and a clear workspace overview.",
+                    highlights: [("rectangle.stack.fill", "Groups"), ("sparkles", "Smart View")]
+                )
+                .tag(3)
+                
+                onboardingHeroPage(
+                    icon: "lock.shield.fill",
+                    gradient: [.green, .teal],
+                    title: "Private by Default",
+                    subtitle: "Stay in control with secure browsing, private sessions, and stronger data separation.",
+                    highlights: [("eye.slash.fill", "Private"), ("checkmark.shield.fill", "Secure")]
+                )
+                .tag(4)
+            }
+            .tabViewStyle(.page(indexDisplayMode: .never))
+            .animation(.spring(duration: 0.5, bounce: 0.15), value: onboardingStep)
+
+            // Bottom Layout: Dots & Button
+            VStack {
+                HStack {
+                    Spacer()
+                    Button {
+                        triggerOnboardingHaptic(style: .light)
+                        hasSeenOnboarding = true
+                        showOnboarding = false
+                        onboardingStep = 0
+                    } label: {
+                        Text("Skip")
+                            .font(.system(size: 15, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 8)
+                            .background(.ultraThinMaterial, in: Capsule())
+                    }
+                    .buttonStyle(.plain)
+                    .opacity(onboardingStep < 4 ? 1 : 0)
+                    .animation(.easeInOut(duration: 0.2), value: onboardingStep)
+                }
+                .padding(.horizontal, 24)
+                .padding(.top, 20)
+
+                Spacer()
+                VStack(spacing: 36) {
+                    // Custom Pagination Dots
+                    HStack(spacing: 10) {
+                        ForEach(0..<5) { i in
+                            Capsule()
+                                .fill(onboardingStep == i ? Color.primary : Color.primary.opacity(0.15))
+                                .frame(width: onboardingStep == i ? 36 : 8, height: 8)
+                                .animation(.spring(duration: 0.4, bounce: 0.4), value: onboardingStep)
+                        }
+                    }
+
+                    Button {
+                        if onboardingStep < 4 {
+                            triggerOnboardingHaptic(style: .light)
+                            withAnimation(.spring(duration: 0.5, bounce: 0.15)) {
+                                onboardingStep += 1
+                            }
+                        } else {
+                            triggerOnboardingCompletionHaptic()
+                            hasSeenOnboarding = true
+                            showOnboarding = false
+                            onboardingStep = 0 // Reset for next time
+                        }
+                    } label: {
+                        HStack(spacing: 10) {
+                            Text(onboardingStep < 4 ? "Continue" : "Get Started")
+                                .font(.system(size: 17, weight: .bold))
+                            Image(systemName: onboardingStep < 4 ? "arrow.right" : "checkmark")
+                                .font(.system(size: 14, weight: .bold))
+                        }
+                            .foregroundStyle(.white)
+                            .frame(maxWidth: .infinity)
+                            .frame(height: 56)
+                            .background(Color.accentColor.gradient)
+                            .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+                            .shadow(color: Color.accentColor.opacity(0.3), radius: 10, y: 5)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(PressableButtonStyle())
+                    .animation(.spring(duration: 0.4, bounce: 0.2), value: onboardingStep)
+                }
+                .padding(.horizontal, 32)
+                .padding(.bottom, 50)
+            }
+        }
+        .onAppear {
+            onboardingStep = 0
+        }
+    }
+
+    private var onboardingWelcomePage: some View {
+        VStack(spacing: 24) {
+            Spacer()
+            
+            ZStack {
+                Circle()
+                    .fill(LinearGradient(colors: [.accentColor.opacity(0.32), .purple.opacity(0.16)], startPoint: .topLeading, endPoint: .bottomTrailing))
+                    .frame(width: 220, height: 220)
+                    .blur(radius: 30)
+
+                Image("OnboardingLogo")
+                    .resizable()
+                    .interpolation(.high)
+                    .scaledToFit()
+                    .frame(width: 156, height: 156)
+                    .clipShape(RoundedRectangle(cornerRadius: 34, style: .continuous))
+                    .shadow(color: Color.cyan.opacity(0.45), radius: 30, y: 0)
+                    .shadow(color: Color.blue.opacity(0.35), radius: 44, y: 0)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 34, style: .continuous)
+                            .strokeBorder(Color.white.opacity(0.16), lineWidth: 1)
+                    )
+                    .shadow(color: .black.opacity(0.24), radius: 20, y: 12)
+            }
+            .padding(.bottom, 8)
+            
+            VStack(spacing: 12) {
+                Text("Welcome to")
+                    .font(.system(size: 22, weight: .semibold, design: .rounded))
+                    .foregroundStyle(.secondary)
+                Text("X Browser")
+                    .font(.system(size: 48, weight: .black, design: .rounded))
+                    .foregroundStyle(.primary)
+                    .tracking(0.6)
+                Text("Fast, focused, and private browsing.")
+                    .font(.system(size: 17, weight: .medium))
+                    .foregroundStyle(.secondary)
+            }
+            .multilineTextAlignment(.center)
+            .padding(.horizontal, 32)
+
+            HStack(spacing: 10) {
+                onboardingContentChip(icon: "bolt.fill", label: "Fast")
+                onboardingContentChip(icon: "slider.horizontal.3", label: "Custom")
+                onboardingContentChip(icon: "lock.fill", label: "Private")
+            }
+            
+            Spacer()
+            Spacer()
+        }
+    }
+
+    private func onboardingHeroPage(icon: String, gradient: [Color], title: String, subtitle: String, highlights: [(String, String)]) -> some View {
+        VStack(spacing: 36) {
+            Spacer()
+            
+            ZStack {
+                Circle()
+                    .fill(LinearGradient(colors: [gradient.first?.opacity(0.35) ?? .clear, gradient.last?.opacity(0.2) ?? .clear], startPoint: .topLeading, endPoint: .bottomTrailing))
+                    .frame(width: 150, height: 150)
+                    .blur(radius: 24)
+                
+                Image(systemName: icon)
+                    .font(.system(size: 54, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .frame(width: 122, height: 122)
+                    .background(
+                        LinearGradient(colors: gradient, startPoint: .topLeading, endPoint: .bottomTrailing)
+                    )
+                    .clipShape(RoundedRectangle(cornerRadius: 34, style: .continuous))
+                    .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 34, style: .continuous))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 34, style: .continuous)
+                            .strokeBorder(Color.white.opacity(0.3), lineWidth: 1)
+                    )
+                    .shadow(color: (gradient.last ?? .black).opacity(0.4), radius: 25, y: 15)
+                    .symbolRenderingMode(.hierarchical)
+            }
+            
+            VStack(spacing: 16) {
+                Text(title)
+                    .font(.system(size: 31, weight: .bold, design: .rounded))
+                    .foregroundStyle(.primary)
+                    .multilineTextAlignment(.center)
+                
+                Text(subtitle)
+                    .font(.system(size: 16, weight: .medium, design: .rounded))
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .lineSpacing(3)
+                    .padding(.horizontal, 6)
+
+                HStack(spacing: 10) {
+                    ForEach(Array(highlights.enumerated()), id: \.offset) { _, item in
+                        onboardingContentChip(icon: item.0, label: item.1)
+                    }
+                }
+                .padding(.top, 2)
+            }
+            .padding(30)
+            .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 32, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 32, style: .continuous)
+                    .strokeBorder(Color.white.opacity(0.12), lineWidth: 0.5)
+            )
+            
+            Spacer()
+            Spacer()
+        }
+        .padding(.horizontal, 32)
+    }
+
+    private func onboardingContentChip(icon: String, label: String) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: icon)
+                .font(.system(size: 12, weight: .bold))
+                .foregroundStyle(.primary)
+            Text(label)
+                .font(.system(size: 12, weight: .semibold, design: .rounded))
+                .foregroundStyle(.primary)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .background(Color.primary.opacity(0.08), in: Capsule())
+        .overlay(
+            Capsule()
+                .strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5)
+        )
+    }
+
+    private func triggerOnboardingHaptic(style: UIImpactFeedbackGenerator.FeedbackStyle) {
+        #if os(iOS)
+        UIImpactFeedbackGenerator(style: style).impactOccurred()
+        #endif
+    }
+
+    private func triggerOnboardingCompletionHaptic() {
+        #if os(iOS)
+        UINotificationFeedbackGenerator().notificationOccurred(.success)
+        #endif
+    }
+
+    private func handleHomeScreenQuickAction(_ action: HomeScreenQuickAction) {
+        #if os(iOS)
+        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+        #endif
+
+        switch action {
+        case .newTab:
+            viewModel.addNewTab()
+            showTabOverview = false
+            showStartPageOverlay = false
+        case .bookmarks:
+            selectedCollectionTab = .bookmarks
+            showHistory = false
+            showBookmarks = true
+        case .history:
+            selectedCollectionTab = .history
+            showBookmarks = false
+            showHistory = true
+        case .settings:
+            showSettings = true
+        }
     }
 
     // MARK: - Helpers
@@ -3013,6 +3976,18 @@ struct ContentView: View {
         } label: {
             Label("Open", systemImage: "arrow.up.forward")
         }
+
+        Button {
+            #if os(iOS)
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            #endif
+            viewModel.addNewTab(url: url)
+            dismissStartPageOverlay()
+        } label: {
+            Label("Open in New Tab", systemImage: "plus.square.on.square")
+        }
+
+        Divider()
 
         Button {
             copyURLToClipboard(url)
